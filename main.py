@@ -1612,13 +1612,6 @@ class TradingBot:
         vol_regime, trend_regime = self.adaptive_regime.update(z_score, hurst)
         regime_name = vol_regime
         
-        # Phase 109: Adaptive Circuit Breaker (Hawkes intensity + Delta directional context)
-        self.candle_count += 1
-        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
-        circuit_breaker = self.adaptive_cb.evaluate(h_lambda, delta, self.candle_count, z_score)
-            
-        print(f"  [{self.timeframe}] Regime: Vol={vol_regime} (Z={z_score:.2f}) | Trend={trend_regime} (H={hurst:.3f}) | CB={circuit_breaker}")
-
         # Snapshot Candle State for All Modules (Phase 48 Unified)
         open_price = float(candle["open"])
         is_green = close > open_price
@@ -1627,6 +1620,14 @@ class TradingBot:
         delta = global_delta_synthetic # Single Source of Truth for logical engines
         vp_context = self.volume_profile.get_context(close)
         footprint_text = self.footprint.format_for_gemini()
+        
+        # Phase 109: Adaptive Circuit Breaker (Hawkes intensity + Delta directional context)
+        # Must be AFTER delta assignment
+        self.candle_count += 1
+        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
+        circuit_breaker = self.adaptive_cb.evaluate(h_lambda, delta, self.candle_count, z_score)
+            
+        print(f"  [{self.timeframe}] Regime: Vol={vol_regime} (Z={z_score:.2f}) | Trend={trend_regime} (H={hurst:.3f}) | CB={circuit_breaker}")
         print(f"  [{self.timeframe}] 📊 Order Flow (LOCAL): Delta={local_delta:+.3f} BTC")
         print(f"  [{self.timeframe}] 🌎 Global Unity: Synthetic Delta={delta:+.3f} BTC | Vol={global_vol_synthetic:.1f} BTC")
 

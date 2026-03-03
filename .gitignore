@@ -1,11 +1,11 @@
 # Sensitive files (API keys, credentials)
 .env
 .env.15m
+.env.1h
 
 # Internal research documents (strategy IP)
 Deep Research/
 Deep Research Prompts/
-.env.1h
 
 # Python
 __pycache__/
@@ -32,6 +32,29 @@ logs/
 vebb_core.zip
 vebb_core/target/
 vebb-ingest/target/
+
+# Test & debug scripts (not production code)
+test_*.py
+verify_*.py
+
+# Training scripts (offline model generation)
+train_*.py
+
+# Data files (too large / regeneratable)
+data/
+
+# One-off utility scripts
+list_models.py
+recalibrate.py
+fetch_data.py
+setup_cron.sh
+
+# Deployment (VPS-specific, not portable)
+deploy.sh
+DEPLOYMENT.md
+
+# Rust lock files (regenerated on build)
+**/Cargo.lock
 
 # OS files
 .DS_Store
