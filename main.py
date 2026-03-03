@@ -1086,7 +1086,7 @@ class TradingBot:
                     )
                     
                     # Update parameters safely
-                    self.hysteresis_multiplier = macro_regime.hysteresis_multiplier
+                    self.hysteresis_multiplier = min(macro_regime.hysteresis_multiplier, 4.0)  # Phase 108: Cap at 4.0
                     self.vol_floor = macro_regime.vol_floor
                     self.last_macro_update_ts = datetime.utcnow()
                     
@@ -1409,8 +1409,32 @@ class TradingBot:
             else:
                 result["reason"] = f"In {vp_context} but GOBI {obi_fused:.2f} & Delta {delta:.1f} fail Reversion checks."
                 
-        else: 
-            result["reason"] = f"Price in Fair Value area ({pct_va:.0f}%)"
+        else:
+            # Phase 108: Trend-Continuation Bypass
+            # When macro + HTF + delta all confirm a directional move,
+            # allow entries even in Fair Value during structural trends
+            macro_bias = getattr(self.current_macro_regime, 'bias', 'NEUTRAL')
+            _htf = getattr(self.multi_tf.current, 'overall_bias', None)
+            htf_bullish = _htf in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]
+            htf_bearish = _htf in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]
+            
+            dyn_thresh = getattr(self.delta_threshold, 'get_threshold', lambda *a, **kw: 50.0)(
+                hurst=getattr(self, '_last_hurst', 0.5),
+                z_gk=getattr(self, '_last_z_gk', 0.0),
+                kyle_current=getattr(self.microstructure, 'kyles_lambda', 0.001) or 0.001,
+                kyle_mean_24h=0.001
+            )
+            
+            if macro_bias == "BULLISH" and htf_bullish and delta > dyn_thresh:
+                result["should_trade"] = True
+                result["direction"] = "LONG"
+                result["reason"] = f"Phase 108 Trend-Continuation LONG (FV {pct_va:.0f}%, Δ={delta:.0f} > Θ={dyn_thresh:.0f}, Macro=BULLISH)"
+            elif macro_bias == "BEARISH" and htf_bearish and delta < -dyn_thresh:
+                result["should_trade"] = True
+                result["direction"] = "SHORT"
+                result["reason"] = f"Phase 108 Trend-Continuation SHORT (FV {pct_va:.0f}%, Δ={delta:.0f} < -Θ={dyn_thresh:.0f}, Macro=BEARISH)"
+            else:
+                result["reason"] = f"Price in Fair Value area ({pct_va:.0f}%)"
             
         # =================================================================
         # PHASE 73: MACRO EMA POINT-BLANK PROXIMITY GUARD
@@ -2844,7 +2868,7 @@ class TradingBot:
         
         print(f"  💸 PARTIAL {reason}: Closing {close_pct*100:.0f}% ({qty_to_close:.3f}) @ ${live_price:,.2f}")
         
-        result = await self.exchange.place_market_order(side_to_close, qty_to_close, estimated_price=live_price)
+        result = await self.exchange.place_market_order(side_to_close, qty_to_close, estimated_price=live_price, reduce_only=True)
         
         if result.success:
             self.position_manager.partial_close(result.price, close_pct, reason)
@@ -2870,7 +2894,7 @@ class TradingBot:
         
         # Execute on exchange
         close_side = OrderSide.SELL if pos.side == Side.LONG else OrderSide.BUY
-        result = await self.exchange.place_market_order(close_side, qty, estimated_price=live_price)
+        result = await self.exchange.place_market_order(close_side, qty, estimated_price=live_price, reduce_only=True)
         
         if result.success:
             # Short sleep to let Binance process the trade history

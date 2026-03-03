@@ -227,7 +227,7 @@ class ExchangeClient:
             print(f"[ExchangeClient] Error fetching klines: {e}")
             return []
     
-    async def place_market_order(self, side: OrderSide, qty: float, estimated_price: float = 0.0) -> OrderResult:
+    async def place_market_order(self, side: OrderSide, qty: float, estimated_price: float = 0.0, reduce_only: bool = False) -> OrderResult:
         """Place a market order."""
         if not self._initialized:
             return OrderResult(
@@ -249,6 +249,10 @@ class ExchangeClient:
                 "type": "MARKET",
                 "quantity": qty,
             }
+            
+            # reduceOnly bypasses $100 minimum notional for close orders
+            if reduce_only:
+                params["reduceOnly"] = "true"
             
             order = await asyncio.to_thread(
                 self._request, "POST", "/fapi/v1/order", params, True
