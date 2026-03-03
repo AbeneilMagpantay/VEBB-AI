@@ -1,0 +1,16 @@
+[package]
+name = "vebb-ingest"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shared_memory = "0.12"
+chrono = "0.4"
+url = "2.5"
+crossbeam = "0.8"
+rustls = { version = "0.23", features = ["ring"] }
+futures-util = "0.3"
