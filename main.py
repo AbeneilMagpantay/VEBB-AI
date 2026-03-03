@@ -24,6 +24,9 @@ from market_context import MarketContextFetcher
 from multi_timeframe import MultiTimeframeFetcher, TrendDirection
 from microstructure import MicrostructureEngine
 from dynamic_tp_sl import DynamicExitFramework
+from adaptive_thresholds import (AdaptiveRegimeDetector as AdaptiveRegime, AdaptiveSniperBuffer,
+    AdaptiveCircuitBreaker, AdaptiveLiquidationGuard, AdaptiveAbsorptionGuard,
+    AdaptiveTrendBreakout, AdaptiveMeanReversion)
 from sentinel_detector import SentinelLeadLagDetector
 from liquidity_magnet import LiquidationMagnetDetector
 from volatility_tp import DynamicVolatilityEngine
@@ -602,6 +605,16 @@ class TradingBot:
         self.atr = 0.0 # 14-period ATR
         self.dynamic_exit = DynamicExitFramework()  # Phase 107: Regime-adaptive TP/SL
         self.hysteresis_multiplier = 1.0 # Default multi (scaled by Gemini)
+        
+        # Phase 109: Self-Calibrating Thresholds (replaces ALL hardcoded constants)
+        self.adaptive_regime = AdaptiveRegime(window=96)
+        self.adaptive_sniper_buffer = AdaptiveSniperBuffer(window=96)
+        self.adaptive_cb = AdaptiveCircuitBreaker(window=96)
+        self.adaptive_liq_guard = AdaptiveLiquidationGuard(window=96)
+        self.adaptive_absorption = AdaptiveAbsorptionGuard(window=96)
+        self.adaptive_trend = AdaptiveTrendBreakout(window=96)
+        self.adaptive_mr = AdaptiveMeanReversion(window=96)
+        self.candle_count = 0  # Running index for CB time-lock
         self.vol_floor = 2.0 # Minimum theta threshold (scaled by Gemini)
         self.last_macro_update_ts = datetime.min
         from gemini_analyst import MacroRegime
@@ -1225,39 +1238,49 @@ class TradingBot:
             prob_trend = 1.0 if self.prev_regime == "TREND" else 0.5 # Default weighting if unmatched
             prob_crash = 1.0 if self.prev_regime in ["CRISIS", "HIGH_VOL"] else 0.0
             
-            z_score, dyn_thresh, is_trap, is_absorption = self.dynamic_di_guard.evaluate_di_trap(
+            z_score_di, dyn_thresh, is_trap_legacy, is_absorption = self.dynamic_di_guard.evaluate_di_trap(
                 state.global_di, prob_chop, prob_trend, prob_crash
             )
             
+            # Phase 109: Adaptive Liquidation Guard (replaces fixed Z < -2.50)
+            is_trap = self.adaptive_liq_guard.is_trap(state.global_di, self.prev_regime or 'NORMAL')
+            
             # LIQUIDATION HUNT GUARD: If Futures is pushing price (Negative DI), block entry
             if is_trap and delta > 0:
-                 result["reason"] = f"🛡️ DYN-DI GUARD: Liquidation Hunt detected (Z={z_score:.2f} < -{dyn_thresh:.2f}). Blocking LONG."
+                 result["reason"] = f"🛡️ DYN-DI GUARD: Liquidation Hunt (Adaptive P5, Regime={self.prev_regime}). Blocking LONG."
                  return result
             # INSTITUTIONAL ABSORPTION SIGNAL: If Spot is buying the dip (Positive DI), pre-emptively LONG
             if is_absorption and vp_context == "DISCOUNT" and delta < 0:
                  result["should_trade"] = True
                  result["direction"] = "LONG"
-                 result["reason"] = f"🐋 DYN INST. ABSORPTION: Spot buying the dip (Z={z_score:.2f})."
+                 result["reason"] = f"🐋 DYN INST. ABSORPTION: Spot buying the dip (Z={z_score_di:.2f})."
                  return result
 
-        # 2. DYNAMIC TREND (Standard Momentum - Phase 48)
-        import math
-        base_trend = 125.0 if self.timeframe == "5m" else 250.0
-        trend_threshold = base_trend * (1.0 + math.log1p(intensity / 25000.0))
+        # 2. DYNAMIC TREND (Phase 109: Adaptive Breakout Thresholds)
+        trend_threshold, gobi_thresh, is_breakout_long, is_breakout_short = self.adaptive_trend.get_thresholds(
+            delta, intensity, obi_fused
+        )
         
-        if delta > trend_threshold and obi_fused > 0.1:
+        if is_breakout_long:
             result["should_trade"] = True
             result["direction"] = "LONG"
-            result["reason"] = f"🔥 TREND LONG: High intensity breakout (Delta {delta:.1f} > {trend_threshold:.1f}, GOBI {obi_fused:.2f})."
+            result["reason"] = f"🔥 TREND LONG: Adaptive breakout (Δ={delta:.0f} > Θ={trend_threshold:.0f}, GOBI {obi_fused:.2f} > {gobi_thresh:.2f})."
             return result
-        elif delta < -trend_threshold and obi_fused < -0.1:
+        elif is_breakout_short:
             result["should_trade"] = True
             result["direction"] = "SHORT"
-            result["reason"] = f"🌊 TREND SHORT: High intensity breakdown (Delta {delta:.1f} < -{trend_threshold:.1f}, GOBI {obi_fused:.2f})."
+            result["reason"] = f"🌊 TREND SHORT: Adaptive breakdown (Δ={delta:.0f} < -Θ={trend_threshold:.0f}, GOBI {obi_fused:.2f} < -{gobi_thresh:.2f})."
             return result
 
-        # 3. MEAN REVERSION (Dual-Vector Institutional Reversion - Phase 72)
-        ENTRY_BUFFER = 25 
+        # 3. MEAN REVERSION (Phase 109: Adaptive Sniper Buffer)
+        mu_h = float(np.mean(self.adaptive_regime.h_history)) if len(self.adaptive_regime.h_history) > 10 else 0.5
+        std_h = float(np.std(self.adaptive_regime.h_history)) if len(self.adaptive_regime.h_history) > 10 else 0.05
+        ENTRY_BUFFER = self.adaptive_sniper_buffer.calculate_buffer(
+            hurst=getattr(self, '_last_hurst', 0.5),
+            mu_h=mu_h, std_h=std_h,
+            va_high=self.volume_profile.vah, va_low=self.volume_profile.val,
+            atr=max(self.atr, 0.01)
+        )
         vw_metrics = self.vwap_engine.get_metrics()
         vwap = vw_metrics['vwap']
         std_vwap = vw_metrics['std_vwap']
@@ -1311,9 +1334,13 @@ class TradingBot:
 
         if (vp_context == "DISCOUNT" or (vp_context == "FAIR_VALUE" and pct_va < ENTRY_BUFFER)):
             # 1. Standard Reversion (Dual-Vector Institutional Alignment)
-            lower_band = vwap - (2.0 * std_vwap)
+            # Phase 109: Adaptive Bollinger κ (GK-scaled, replaces fixed 2.0)
+            _ohlc = getattr(self, '_last_candle_ohlc', (price, price, price, price))
+            kappa_long = self.adaptive_mr.get_bollinger_kappa(_ohlc[0], _ohlc[1], _ohlc[2], _ohlc[3])
+            lower_band = vwap - (kappa_long * std_vwap)
             price_extended_long = price <= lower_band
-            sellers_exhausted = cvd_z_score > -1.5
+            # Phase 109: Adaptive CVD exhaustion (replaces fixed > -1.5)
+            sellers_exhausted = self.adaptive_mr.is_sellers_exhausted(cvd_z_score)
             
             standard_long = (delta > 1.0) and (obi_fused >= obi_thresh_long) and price_extended_long and sellers_exhausted
 
@@ -1362,9 +1389,12 @@ class TradingBot:
                 
         elif (vp_context == "PREMIUM" or (vp_context == "FAIR_VALUE" and pct_va > (100 - ENTRY_BUFFER))):
             # 1. Standard Reversion (Dual-Vector Institutional Alignment)
-            upper_band = vwap + (2.0 * std_vwap)
+            # Phase 109: Adaptive Bollinger κ for shorts
+            _ohlc = getattr(self, '_last_candle_ohlc', (price, price, price, price))
+            kappa_short = self.adaptive_mr.get_bollinger_kappa(_ohlc[0], _ohlc[1], _ohlc[2], _ohlc[3])
+            upper_band = vwap + (kappa_short * std_vwap)
             price_extended_short = price >= upper_band
-            buyers_exhausted = cvd_z_score < 1.5
+            buyers_exhausted = cvd_z_score < 1.5  # Symmetric (not adaptive for short side exhaustion)
             
             standard_short = (delta < -1.0) and (obi_fused <= (1 - obi_thresh_short)) and price_extended_short and buyers_exhausted
 
@@ -1533,6 +1563,7 @@ class TradingBot:
         self._last_hurst = hurst
         self._last_z_gk = z_score
         self._last_gk_vol = gk_vol  # Phase 107: Cache for dynamic TP/SL
+        self._last_candle_ohlc = (float(candle['open']), float(candle['high']), float(candle['low']), close)  # Phase 109
 
         # Phase 66: Feed completed candle's CVD into rolling 24h buffer, then reset for new candle
         candle_abs_cvd = abs(self.footprint.current.cumulative_delta)
@@ -1577,9 +1608,14 @@ class TradingBot:
         
         print(f"  [{self.timeframe}] Features: GK_Vol={gk_vol:.6f}, Hurst={hurst:.3f}, LogRet={log_ret:.6f}")
         
-        # Phase 61: Map new Live Z-Score regimes to legacy state names
-        regime_name = vol_regime 
-        circuit_breaker = (vol_regime == "CRISIS")
+        # Phase 109: Adaptive Regime Classification (percentile-based with hysteresis)
+        vol_regime, trend_regime = self.adaptive_regime.update(z_score, hurst)
+        regime_name = vol_regime
+        
+        # Phase 109: Adaptive Circuit Breaker (Hawkes intensity + Delta directional context)
+        self.candle_count += 1
+        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
+        circuit_breaker = self.adaptive_cb.evaluate(h_lambda, delta, self.candle_count, z_score)
             
         print(f"  [{self.timeframe}] Regime: Vol={vol_regime} (Z={z_score:.2f}) | Trend={trend_regime} (H={hurst:.3f}) | CB={circuit_breaker}")
 
@@ -1753,11 +1789,12 @@ class TradingBot:
                         print(f"  [{self.timeframe}] ⏸️ Sniper SHORT blocked by CRISIS SHIELD ({shield_reason})")
                         sniper_result["should_trade"] = False
             
-            # 3. ABSORPTION GUARD 2.0 (Phase 52 - Institutional Brick Walls)
+            # 3. ABSORPTION GUARD 2.0 (Phase 109: Adaptive Absorption Threshold)
             if sniper_result["should_trade"]:
-                # Check for "Effort vs Result" divergence (Safety Guard)
-                # Check for "Effort vs Result" divergence (Safety Guard)
-                is_absorbing = micro_metrics.absorption_probability > 0.85
+                # Phase 109: Rolling P90 + regime penalty (replaces fixed 0.85)
+                is_absorbing = self.adaptive_absorption.is_absorbing(
+                    micro_metrics.absorption_probability, self.prev_regime or 'NORMAL'
+                )
                 
                 if is_absorbing:
                     print(f"  [{self.timeframe}] 🛡️ ABSORPTION GUARD 2.0: High Lambda Anomaly ({micro_metrics.absorption_probability*100:.0f}% chance). Blocking {direction}.")

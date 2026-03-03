@@ -1,6 +1,10 @@
 # Sensitive files (API keys, credentials)
 .env
 .env.15m
+
+# Internal research documents (strategy IP)
+Deep Research/
+Deep Research Prompts/
 .env.1h
 
 # Python
