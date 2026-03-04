@@ -1,5 +1,5 @@
 """
-VEBB-AI: Self-Calibrating Threshold Framework (Phase 109)
+VEBB-AI: Self-Calibrating Threshold Framework (Phase 109 + Phase 111)
 
 Replaces all hardcoded numerical thresholds with percentile-based,
 rolling, regime-aware alternatives.
@@ -11,6 +11,8 @@ Derived from Deep Research: "Adaptive Thresholds for BTC HFT"
 """
 
 import numpy as np
+import math
+import bisect
 from collections import deque
 
 
@@ -336,3 +338,233 @@ class AdaptiveMeanReversion:
 
         p10_cvdz = np.percentile(list(self.cvdz_history), 10)
         return current_cvd_z > (p10_cvdz + 0.5)
+
+
+# =============================================================================
+# Phase 111: Self-Calibrating Predator Filter Thresholds
+# Eliminates all hardcoded constants from Phase 110's Context-Aware
+# Metric Substitution. Derived from Deep Research: "Self-Calibrating
+# Predator Filter Thresholds"
+# =============================================================================
+
+
+class AdaptiveHawkesEWMA:
+    """
+    Phase 111: Replaces fixed gamma=0.05 EWMA with Kaufman Efficiency
+    Ratio-driven adaptive smoothing. Responds instantly to clean breakouts
+    (ER→1, gamma→0.44) and suppresses noise during chop (ER→0, gamma→0.004).
+    """
+
+    def __init__(self, n: int = 10, fast_len: int = 2, slow_len: int = 30):
+        self.n = n
+        self.sc_fast = 2.0 / (fast_len + 1.0)
+        self.sc_slow = 2.0 / (slow_len + 1.0)
+        self.lambda_history = deque(maxlen=n + 1)
+        self._hawkes_ewma_mu = 0.0
+        self._hawkes_ewma_var = 0.0
+        self._initialized = False
+
+    def update(self, h_lambda: float) -> float:
+        """Update EWMA with adaptive gamma, returns current Hawkes Z-score."""
+        self.lambda_history.append(h_lambda)
+
+        # Calculate adaptive gamma via Kaufman Efficiency Ratio
+        if len(self.lambda_history) < self.n + 1:
+            gamma = 0.05  # Cold-start fallback
+        else:
+            directional_change = abs(self.lambda_history[-1] - self.lambda_history[0])
+            volatility = sum(abs(self.lambda_history[i] - self.lambda_history[i - 1])
+                             for i in range(1, len(self.lambda_history)))
+            er = directional_change / volatility if volatility != 0.0 else 0.0
+            gamma = (er * (self.sc_fast - self.sc_slow) + self.sc_slow) ** 2
+
+        # Initialize or update EWMA
+        if not self._initialized:
+            self._hawkes_ewma_mu = h_lambda
+            self._hawkes_ewma_var = max((h_lambda * 0.1) ** 2, 1.0)
+            self._initialized = True
+        else:
+            self._hawkes_ewma_mu = gamma * h_lambda + (1 - gamma) * self._hawkes_ewma_mu
+            self._hawkes_ewma_var = gamma * ((h_lambda - self._hawkes_ewma_mu) ** 2) + \
+                                    (1 - gamma) * self._hawkes_ewma_var
+
+        sigma = max(self._hawkes_ewma_var ** 0.5, 0.01)
+        hawkes_z = (h_lambda - self._hawkes_ewma_mu) / sigma
+        return float(hawkes_z)
+
+
+class AdaptiveBreakoutDetector:
+    """
+    Phase 111: Replaces fixed hawkes_z > 2.0 with rolling P95 of
+    Z-score history. Heavy-tailed distributions need percentile-based
+    thresholds, not Gaussian assumptions.
+    """
+
+    def __init__(self, buffer_size: int = 96, target_percentile: int = 95):
+        self.buffer_size = buffer_size
+        self.target_percentile = target_percentile
+        self.z_buffer = deque(maxlen=buffer_size)
+
+    def evaluate_and_update(self, current_hawkes_z: float, abs_delta: float,
+                            delta_p90: float, is_htf_aligned: bool) -> tuple:
+        """
+        Causal evaluation then state update.
+        Returns (is_breakout_regime: bool, dynamic_threshold: float).
+        """
+        # 1. Causal: threshold from past data only
+        if len(self.z_buffer) < self.buffer_size:
+            dynamic_threshold = 2.0  # Cold-start Gaussian fallback
+        else:
+            dynamic_threshold = float(np.percentile(self.z_buffer, self.target_percentile))
+
+        is_breakout = (current_hawkes_z > dynamic_threshold) and \
+                      (abs_delta > delta_p90) and \
+                      is_htf_aligned
+
+        # 2. State update: append AFTER evaluation
+        self.z_buffer.append(current_hawkes_z)
+
+        return is_breakout, dynamic_threshold
+
+
+class AdaptiveTFIThreshold:
+    """
+    Phase 111: Replaces fixed TFI > 0.40 with rolling P80 of |TFI|.
+    Automatically tightens during thin Asian sessions (high TFI variance)
+    and relaxes during heavy US sessions (compressed TFI variance).
+    """
+
+    def __init__(self, buffer_size: int = 96, target_percentile: int = 80):
+        self.buffer_size = buffer_size
+        self.target_percentile = target_percentile
+        self.abs_tfi_buffer = deque(maxlen=buffer_size)
+
+    def evaluate_and_update(self, current_tfi: float) -> tuple:
+        """
+        Causal evaluation then state update.
+        Returns (is_tfi_valid: bool, dynamic_threshold: float).
+        """
+        abs_tfi = abs(current_tfi)
+
+        # 1. Causal: threshold from past data only
+        if len(self.abs_tfi_buffer) < self.buffer_size:
+            dynamic_threshold = 0.40  # Cold-start fallback
+        else:
+            dynamic_threshold = float(np.percentile(self.abs_tfi_buffer, self.target_percentile))
+
+        is_valid = abs_tfi >= dynamic_threshold
+
+        # 2. State update
+        self.abs_tfi_buffer.append(abs_tfi)
+
+        return is_valid, dynamic_threshold
+
+
+class AdaptiveSigmoidCalibration:
+    """
+    Phase 111: Replaces hardcoded OBI_MIN=0.20, OBI_MAX=0.80, K=1.5,
+    L_MID=2.5 with empirically derived values from rolling distributions.
+    The sigmoid curve reshapes itself to match current market topology.
+    """
+
+    def __init__(self, buffer_size: int = 96):
+        self.buffer_size = buffer_size
+        self.obi_buffer = deque(maxlen=buffer_size)
+        self.z_buffer = deque(maxlen=buffer_size)
+
+    def get_adaptive_threshold(self, current_hawkes_z: float, current_obi: float,
+                               rv_mult: float = 1.0, hurst_mult: float = 1.0) -> float:
+        """
+        Causal sigmoid evaluation with self-calibrating parameters.
+        Returns the OBI threshold for non-breakout regimes.
+        """
+        # 1. Causal: derive parameters from past data only
+        if len(self.obi_buffer) < self.buffer_size or len(self.z_buffer) < self.buffer_size:
+            obi_max, obi_min, k, l_mid = 0.80, 0.20, 1.5, 2.5
+        else:
+            obi_arr = np.array(self.obi_buffer)
+            z_arr = np.array(self.z_buffer)
+
+            obi_max = float(np.percentile(obi_arr, 90))
+            obi_min = float(np.percentile(obi_arr, 20))
+
+            l_mid = float(np.percentile(z_arr, 75))
+            z_85 = float(np.percentile(z_arr, 85))
+            z_65 = float(np.percentile(z_arr, 65))
+
+            delta_z = max(z_85 - z_65, 0.01)
+            k = math.log(9) / delta_z
+
+        # Ensure min < max
+        obi_min = min(obi_min, obi_max - 0.05)
+
+        # Sigmoid: maps Z-score to [0, 1]
+        exp_val = min(k * (current_hawkes_z - l_mid), 500)  # Overflow protection
+        sigmoid_val = 1.0 / (1.0 + math.exp(-exp_val))
+
+        # High Z → low threshold (sigmoid→1 → threshold drops toward OBI_MIN)
+        threshold = obi_max - (obi_max - obi_min) * sigmoid_val
+
+        # Apply multipliers
+        threshold *= rv_mult * hurst_mult
+        threshold = max(0.05, min(threshold, 0.80))
+
+        # 2. State update
+        self.obi_buffer.append(abs(current_obi))
+        self.z_buffer.append(current_hawkes_z)
+
+        return float(threshold)
+
+
+class AdaptiveMultipliers:
+    """
+    Phase 111: Replaces rv*10.0 and hurst-0.5 with ECDF percentile rank.
+    Maps unbounded metrics to bounded [0.5x, 1.5x] multipliers via
+    empirical cumulative distribution function.
+    """
+
+    def __init__(self, buffer_size: int = 96):
+        self.buffer_size = buffer_size
+        self.rv_sorted = []
+        self.hurst_sorted = []
+        self.rv_queue = deque(maxlen=buffer_size)
+        self.hurst_queue = deque(maxlen=buffer_size)
+
+    def _get_rank(self, sorted_list: list, value: float) -> float:
+        if not sorted_list:
+            return 0.5
+        idx = bisect.bisect_left(sorted_list, value)
+        return idx / len(sorted_list)
+
+    def _update_buffer(self, sorted_list: list, queue: deque, value: float):
+        if len(queue) == self.buffer_size:
+            old_val = queue[0]  # Will be popped by deque maxlen
+            old_idx = bisect.bisect_left(sorted_list, old_val)
+            if old_idx < len(sorted_list) and sorted_list[old_idx] == old_val:
+                del sorted_list[old_idx]
+        queue.append(value)
+        bisect.insort(sorted_list, value)
+
+    def evaluate_and_update(self, current_rv: float, current_hurst: float) -> tuple:
+        """
+        Causal evaluation then state update.
+        Returns (rv_mult: float, hurst_mult: float).
+        """
+        # 1. Causal: rank against past data only
+        if len(self.rv_queue) < self.buffer_size:
+            rv_mult = 1.0
+            hurst_mult = 1.0
+        else:
+            rv_rank = self._get_rank(self.rv_sorted, current_rv)
+            hurst_rank = self._get_rank(self.hurst_sorted, current_hurst)
+
+            # Scale rank [0,1] to symmetric multiplier [0.5x, 1.5x]
+            rv_mult = 1.0 + (rv_rank - 0.5)
+            # Invert Hurst: low rank (choppy) → high penalty
+            hurst_mult = 1.0 - (hurst_rank - 0.5)
+
+        # 2. State update
+        self._update_buffer(self.rv_sorted, self.rv_queue, current_rv)
+        self._update_buffer(self.hurst_sorted, self.hurst_queue, current_hurst)
+
+        return float(rv_mult), float(hurst_mult)

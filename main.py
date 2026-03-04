@@ -26,7 +26,9 @@ from microstructure import MicrostructureEngine
 from dynamic_tp_sl import DynamicExitFramework
 from adaptive_thresholds import (AdaptiveRegimeDetector as AdaptiveRegime, AdaptiveSniperBuffer,
     AdaptiveCircuitBreaker, AdaptiveLiquidationGuard, AdaptiveAbsorptionGuard,
-    AdaptiveTrendBreakout, AdaptiveMeanReversion)
+    AdaptiveTrendBreakout, AdaptiveMeanReversion,
+    AdaptiveHawkesEWMA, AdaptiveBreakoutDetector, AdaptiveTFIThreshold,
+    AdaptiveSigmoidCalibration, AdaptiveMultipliers)
 from sentinel_detector import SentinelLeadLagDetector
 from liquidity_magnet import LiquidationMagnetDetector
 from volatility_tp import DynamicVolatilityEngine
@@ -614,6 +616,12 @@ class TradingBot:
         self.adaptive_absorption = AdaptiveAbsorptionGuard(window=96)
         self.adaptive_trend = AdaptiveTrendBreakout(window=96)
         self.adaptive_mr = AdaptiveMeanReversion(window=96)
+        # Phase 111: Self-Calibrating Predator Filter
+        self.adaptive_hawkes = AdaptiveHawkesEWMA(n=10)
+        self.adaptive_breakout = AdaptiveBreakoutDetector(buffer_size=96, target_percentile=95)
+        self.adaptive_tfi = AdaptiveTFIThreshold(buffer_size=96, target_percentile=80)
+        self.adaptive_sigmoid = AdaptiveSigmoidCalibration(buffer_size=96)
+        self.adaptive_mults = AdaptiveMultipliers(buffer_size=96)
         self.candle_count = 0  # Running index for CB time-lock
         self.vol_floor = 2.0 # Minimum theta threshold (scaled by Gemini)
         self.last_macro_update_ts = datetime.min
@@ -1566,15 +1574,18 @@ class TradingBot:
         self.delta_threshold.feed_candle_cvd(candle_abs_cvd)
         self.delta_threshold.reset_candle(self.microstructure.hawkes_lambda)
 
-        # Phase 110: Update EWMA Hawkes Z-score on EVERY candle close (not just Sniper fires)
+        # Phase 111: Update Kaufman-adaptive EWMA Hawkes Z on every candle close
         h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
-        if not hasattr(self, '_hawkes_ewma_mu'):
-            self._hawkes_ewma_mu = h_lambda
-            self._hawkes_ewma_var = max((h_lambda * 0.1) ** 2, 1.0)  # Bootstrap σ at 10% of first value
-        gamma_h = 0.05
-        self._hawkes_ewma_mu = gamma_h * h_lambda + (1 - gamma_h) * self._hawkes_ewma_mu
-        self._hawkes_ewma_var = gamma_h * (h_lambda - self._hawkes_ewma_mu) ** 2 + (1 - gamma_h) * self._hawkes_ewma_var
-        self._hawkes_z = (h_lambda - self._hawkes_ewma_mu) / max(self._hawkes_ewma_var ** 0.5, 0.01)
+        self._hawkes_z = self.adaptive_hawkes.update(h_lambda)
+
+        # Phase 111: Feed TFI buffer on every candle (for volume-conditioned calibration)
+        fp = self.footprint.current
+        total_v = fp.total_buy_volume + fp.total_sell_volume
+        candle_tfi = (fp.total_buy_volume - fp.total_sell_volume) / total_v if total_v > 0 else 0.0
+        self.adaptive_tfi.evaluate_and_update(candle_tfi)  # Feed buffer, ignore result
+
+        # Phase 111: Feed ECDF multiplier buffers on every candle
+        self.adaptive_mults.evaluate_and_update(gk_vol, hurst)
 
         # Phase 48: Dynamic TP Volatility Tracking
         self.vol_buffer.append(gk_vol)
@@ -1870,11 +1881,8 @@ class TradingBot:
             self.footprint.reset()
             return
 
-        # 2. Phase 110: Detect Breakout Regime using pre-computed EWMA Hawkes Z-score
-        # (EWMA updates on every candle close in main loop, so Z has full history)
+        # 2. Phase 111: Self-Calibrating Breakout Detection
         hawkes_z = getattr(self, '_hawkes_z', 0.0)
-        
-        # Breakout conditions: Hawkes Z > 2.0, |Delta| > rolling P90, HTF aligned
         delta_p90 = float(np.percentile(list(self.adaptive_trend.delta_history), 90)) if len(self.adaptive_trend.delta_history) > 20 else 500.0
         
         is_htf_aligned = (
@@ -1882,11 +1890,13 @@ class TradingBot:
             (direction == "SHORT" and htf_bias in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH])
         )
         
-        is_breakout_regime = (hawkes_z > 2.0) and (abs(delta) > delta_p90) and is_htf_aligned
+        # Rolling P95 replaces fixed Z > 2.0 (adapts to heavy-tailed Hawkes distribution)
+        is_breakout_regime, z_thresh = self.adaptive_breakout.evaluate_and_update(
+            hawkes_z, abs(delta), delta_p90, is_htf_aligned
+        )
         
         # 3. METRIC SUBSTITUTION: TFI during breakouts, OBI during ranging
         if is_breakout_regime:
-            # Trade Flow Imbalance (aggressive executed volume, not passive book)
             vol_buy = self.footprint.current.total_buy_volume
             vol_sell = self.footprint.current.total_sell_volume
             total_vol = vol_buy + vol_sell
@@ -1897,31 +1907,28 @@ class TradingBot:
                 else:
                     tfi = (vol_sell - vol_buy) / total_vol
                 
-                tfi_threshold = 0.40  # Research recommends 0.60, softened to 0.40 for early entries
+                # Phase 111: Rolling P80 TFI threshold (adapts to session volume)
+                is_tfi_valid, tfi_threshold = self.adaptive_tfi.evaluate_and_update(tfi)
                 
-                if tfi >= tfi_threshold:
-                    print(f"  [{self.timeframe}] 🔥 PREDATOR BYPASS (Phase 110): Breakout regime (Hz={hawkes_z:.1f}, Δ={delta:.0f}>{delta_p90:.0f}). TFI={tfi:.2f} ≥ {tfi_threshold} ✅")
+                if is_tfi_valid:
+                    print(f"  [{self.timeframe}] 🔥 PREDATOR BYPASS (Phase 111): Breakout (Hz={hawkes_z:.1f}>{z_thresh:.1f}, Δ={delta:.0f}>{delta_p90:.0f}). TFI={tfi:.2f} ≥ {tfi_threshold:.2f} ✅")
                 else:
-                    print(f"  [{self.timeframe}] ⏸️ Predator Filter (TFI Mode): TFI {tfi:.2f} < {tfi_threshold} despite breakout regime. Blocking {direction}.")
+                    print(f"  [{self.timeframe}] ⏸️ Predator (TFI Mode): TFI {tfi:.2f} < {tfi_threshold:.2f} (P80). Blocking {direction}.")
                     self.footprint.reset()
                     return
             else:
-                print(f"  [{self.timeframe}] ⏸️ Predator Filter: Zero volume in breakout — low liquidity fakeout. Blocking.")
+                print(f"  [{self.timeframe}] ⏸️ Predator: Zero volume in breakout — fakeout. Blocking.")
                 self.footprint.reset()
                 return
         else:
-            # Standard OBI evaluation for non-breakout regimes
-            abs_delta = abs(delta)
-            BASE_THRESHOLD = 0.85 / (1.0 + (abs_delta / 60.0))
+            # Phase 111: ECDF-based multipliers (replaces rv*10 and hurst-0.5)
+            rv_mult, hurst_mult = self.adaptive_mults.evaluate_and_update(gk_vol, hurst)
             
-            # Fix: Pass EWMA-normalized Hawkes Z instead of raw intensity
-            PREDATOR_OBI_THRESHOLD = self.microstructure.get_adaptive_threshold(
-                BASE_THRESHOLD, gk_vol, hurst,
-                intensity=hawkes_z,  # Phase 110: Corrected — now passes Z-score, not raw λ
-                iceberg=micro_metrics.iceberg_score
+            # Phase 111: Self-calibrating sigmoid (replaces OBI_MIN/MAX/K/L_MID)
+            PREDATOR_OBI_THRESHOLD = self.adaptive_sigmoid.get_adaptive_threshold(
+                hawkes_z, current_obi, rv_mult=rv_mult, hurst_mult=hurst_mult
             )
-            if PREDATOR_OBI_THRESHOLD != BASE_THRESHOLD:
-                print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI: {BASE_THRESHOLD:.2f} -> {PREDATOR_OBI_THRESHOLD:.2f} (RV={gk_vol:.4f}, H={hurst:.2f}, Hz={hawkes_z:.1f})")
+            print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI (P111): thresh={PREDATOR_OBI_THRESHOLD:.2f} (Hz={hawkes_z:.1f}, RVm={rv_mult:.2f}, Hm={hurst_mult:.2f})")
             
             if direction == "LONG" and current_obi < PREDATOR_OBI_THRESHOLD:
                 dir_msg = "Wrong side" if current_obi < 0 else "Too weak"
