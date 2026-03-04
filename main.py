@@ -1948,7 +1948,8 @@ class TradingBot:
             
             # Phase 111: Self-calibrating sigmoid (replaces OBI_MIN/MAX/K/L_MID)
             PREDATOR_OBI_THRESHOLD = self.adaptive_sigmoid.get_adaptive_threshold(
-                hawkes_z, current_obi, rv_mult=rv_mult, hurst_mult=hurst_mult
+                hawkes_z, current_obi, rv_mult=rv_mult, hurst_mult=hurst_mult,
+                abs_delta=abs(delta)
             )
             print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI (P111): thresh={PREDATOR_OBI_THRESHOLD:.2f} (Hz={hawkes_z:.1f}, RVm={rv_mult:.2f}, Hm={hurst_mult:.2f})")
             

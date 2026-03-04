@@ -473,27 +473,37 @@ class AdaptiveSigmoidCalibration:
         self.z_buffer = deque(maxlen=buffer_size)
 
     def get_adaptive_threshold(self, current_hawkes_z: float, current_obi: float,
-                               rv_mult: float = 1.0, hurst_mult: float = 1.0) -> float:
+                               rv_mult: float = 1.0, hurst_mult: float = 1.0,
+                               abs_delta: float = 0.0) -> float:
         """
         Causal sigmoid evaluation with self-calibrating parameters.
         Returns the OBI threshold for non-breakout regimes.
+        Cold-start: falls back to the old delta-based formula (no hardcoded sigmoid params).
         """
         # 1. Causal: derive parameters from past data only
         if len(self.obi_buffer) < self.buffer_size or len(self.z_buffer) < self.buffer_size:
-            obi_max, obi_min, k, l_mid = 0.80, 0.20, 1.5, 2.5
-        else:
-            obi_arr = np.array(self.obi_buffer)
-            z_arr = np.array(self.z_buffer)
+            # Cold-start fallback: use the proven delta-based formula from Phase 110
+            # This naturally scales: high delta → low threshold, low delta → high threshold
+            threshold = 0.85 / (1.0 + (abs_delta / 60.0))
+            threshold *= rv_mult * hurst_mult
+            threshold = max(0.05, min(threshold, 0.80))
+            self.obi_buffer.append(abs(current_obi))
+            self.z_buffer.append(current_hawkes_z)
+            return float(threshold)
 
-            obi_max = float(np.percentile(obi_arr, 90))
-            obi_min = float(np.percentile(obi_arr, 20))
+        # Warmed up: use self-calibrating sigmoid
+        obi_arr = np.array(self.obi_buffer)
+        z_arr = np.array(self.z_buffer)
 
-            l_mid = float(np.percentile(z_arr, 75))
-            z_85 = float(np.percentile(z_arr, 85))
-            z_65 = float(np.percentile(z_arr, 65))
+        obi_max = float(np.percentile(obi_arr, 90))
+        obi_min = float(np.percentile(obi_arr, 20))
 
-            delta_z = max(z_85 - z_65, 0.01)
-            k = math.log(9) / delta_z
+        l_mid = float(np.percentile(z_arr, 75))
+        z_85 = float(np.percentile(z_arr, 85))
+        z_65 = float(np.percentile(z_arr, 65))
+
+        delta_z = max(z_85 - z_65, 0.01)
+        k = math.log(9) / delta_z
 
         # Ensure min < max
         obi_min = min(obi_min, obi_max - 0.05)
