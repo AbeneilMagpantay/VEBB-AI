@@ -1592,9 +1592,10 @@ class TradingBot:
         candle_o = float(candle['open'])
         candle_h = float(candle['high'])
         candle_l = float(candle['low'])
+        candle_delta = self.footprint.current.cumulative_delta  # Use footprint delta (defined before main delta)
         self.adaptive_cpr.evaluate_and_update(
             "NEUTRAL", candle_o, candle_h, candle_l, close,
-            delta, self._hawkes_z, is_pre_emptive=True  # Feed only, don't evaluate
+            candle_delta, self._hawkes_z, is_pre_emptive=True  # Feed only, don't evaluate
         )
 
         # Phase 48: Dynamic TP Volatility Tracking
