@@ -568,3 +568,78 @@ class AdaptiveMultipliers:
         self._update_buffer(self.hurst_sorted, self.hurst_queue, current_hurst)
 
         return float(rv_mult), float(hurst_mult)
+
+
+class AdaptiveCPR:
+    """
+    Phase 112: Replaces binary candle color (red/green) with continuous
+    Close Position within Range: CPR = (Close - Low) / (High - Low).
+    
+    Three-tier evaluation:
+    1. Delta P90 Override: extreme flow bypasses all color checks
+    2. CPR > rolling P50: candle closed in upper half → structurally strong
+    3. Baseline: if both fail AND candle is red, BLOCK (ranging protection)
+    """
+
+    def __init__(self, buffer_size: int = 96):
+        self.buffer_size = buffer_size
+        self.cpr_buffer = deque(maxlen=buffer_size)
+        self.delta_buffer = deque(maxlen=buffer_size)
+
+    def evaluate_and_update(self, direction: str, o: float, h: float, l: float, c: float,
+                            delta: float, hawkes_z: float, is_pre_emptive: bool = False) -> tuple:
+        """
+        Causal evaluation then state update.
+        Returns (should_allow: bool, reason: str, cpr: float).
+        """
+        # PRE-EMPTIVE exhaustion fades always pass
+        if is_pre_emptive:
+            return True, "PRE-EMPTIVE bypass", 0.5
+
+        # Calculate CPR
+        candle_range = h - l
+        cpr = (c - l) / candle_range if candle_range > 0 else 0.5
+
+        is_red = c < o
+        is_green = c > o
+
+        # 1. Causal: thresholds from past data only
+        if len(self.cpr_buffer) < self.buffer_size:
+            cpr_threshold = 0.50  # Cold-start default: median
+            delta_p90 = 500.0  # Cold-start default
+        else:
+            cpr_threshold = float(np.percentile(self.cpr_buffer, 50))
+            delta_p90 = float(np.percentile(self.delta_buffer, 90))
+
+        should_allow = True
+        reason = "passed"
+
+        if direction == "LONG":
+            if is_red:
+                # Override Alpha: extreme bullish flow → bypass color
+                if delta > 0 and delta >= delta_p90 and hawkes_z > 2.0:
+                    reason = f"DELTA OVERRIDE (Δ={delta:.0f}>P90={delta_p90:.0f}, Hz={hawkes_z:.1f})"
+                # Override Beta: CPR shows strength despite red
+                elif cpr >= cpr_threshold:
+                    reason = f"CPR OVERRIDE ({cpr:.2f}>P50={cpr_threshold:.2f})"
+                else:
+                    should_allow = False
+                    reason = f"RED candle, CPR {cpr:.2f}<{cpr_threshold:.2f}, Δ={delta:.0f}<P90={delta_p90:.0f}"
+
+        elif direction == "SHORT":
+            if is_green:
+                # Override Alpha: extreme bearish flow → bypass color
+                if delta < 0 and abs(delta) >= delta_p90 and hawkes_z > 2.0:
+                    reason = f"DELTA OVERRIDE (Δ={delta:.0f}, |Δ|>P90={delta_p90:.0f}, Hz={hawkes_z:.1f})"
+                # Override Beta: CPR shows weakness despite green
+                elif cpr <= (1.0 - cpr_threshold):
+                    reason = f"CPR OVERRIDE ({cpr:.2f}<{1.0-cpr_threshold:.2f})"
+                else:
+                    should_allow = False
+                    reason = f"GREEN candle, CPR {cpr:.2f}>{1.0-cpr_threshold:.2f}, |Δ|={abs(delta):.0f}<P90={delta_p90:.0f}"
+
+        # 2. State update: ALWAYS feed buffers (every candle in main loop)
+        self.cpr_buffer.append(cpr)
+        self.delta_buffer.append(abs(delta))
+
+        return should_allow, reason, cpr

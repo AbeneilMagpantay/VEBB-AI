@@ -28,7 +28,7 @@ from adaptive_thresholds import (AdaptiveRegimeDetector as AdaptiveRegime, Adapt
     AdaptiveCircuitBreaker, AdaptiveLiquidationGuard, AdaptiveAbsorptionGuard,
     AdaptiveTrendBreakout, AdaptiveMeanReversion,
     AdaptiveHawkesEWMA, AdaptiveBreakoutDetector, AdaptiveTFIThreshold,
-    AdaptiveSigmoidCalibration, AdaptiveMultipliers)
+    AdaptiveSigmoidCalibration, AdaptiveMultipliers, AdaptiveCPR)
 from sentinel_detector import SentinelLeadLagDetector
 from liquidity_magnet import LiquidationMagnetDetector
 from volatility_tp import DynamicVolatilityEngine
@@ -622,6 +622,7 @@ class TradingBot:
         self.adaptive_tfi = AdaptiveTFIThreshold(buffer_size=96, target_percentile=80)
         self.adaptive_sigmoid = AdaptiveSigmoidCalibration(buffer_size=96)
         self.adaptive_mults = AdaptiveMultipliers(buffer_size=96)
+        self.adaptive_cpr = AdaptiveCPR(buffer_size=96)  # Phase 112: CPR + Delta Override
         self.candle_count = 0  # Running index for CB time-lock
         self.vol_floor = 2.0 # Minimum theta threshold (scaled by Gemini)
         self.last_macro_update_ts = datetime.min
@@ -1587,6 +1588,15 @@ class TradingBot:
         # Phase 111: Feed ECDF multiplier buffers on every candle
         self.adaptive_mults.evaluate_and_update(gk_vol, hurst)
 
+        # Phase 112: Feed CPR buffer on every candle (for self-calibrating close position)
+        candle_o = float(candle['open'])
+        candle_h = float(candle['high'])
+        candle_l = float(candle['low'])
+        self.adaptive_cpr.evaluate_and_update(
+            "NEUTRAL", candle_o, candle_h, candle_l, close,
+            delta, self._hawkes_z, is_pre_emptive=True  # Feed only, don't evaluate
+        )
+
         # Phase 48: Dynamic TP Volatility Tracking
         self.vol_buffer.append(gk_vol)
         if len(self.vol_buffer) > 20:
@@ -1819,14 +1829,25 @@ class TradingBot:
                     sniper_result["should_trade"] = False
                     sniper_result["reason"] = f"Passive Absorption Detected ({micro_metrics.absorption_probability*100:.0f}%)"
                 
-                # Check for "Zero-Lag" Candle Color alignment
-                # NOTE: Bypass this limitation for PRE-EMPTIVE exhaustion fades (catching a falling knife deliberately).
-                elif direction == "LONG" and is_red and "PRE-EMPTIVE" not in sniper_result.get("reason", ""):
-                    print(f"  [{self.timeframe}] ⚠️ ABSORPTION DETECTED: Sniper wants LONG but candle is RED. Aborting.")
+                # Phase 112: Replace binary candle color with CPR + Delta Override
+                is_pre_emptive = "PRE-EMPTIVE" in sniper_result.get("reason", "")
+                hawkes_z = getattr(self, '_hawkes_z', 0.0)
+                o_price = float(candle['open']) if 'candle' in dir() else close  # Get candle open
+                h_price = float(candle['high']) if 'candle' in dir() else close
+                l_price = float(candle['low']) if 'candle' in dir() else close
+                
+                color_allowed, color_reason, cpr_val = self.adaptive_cpr.evaluate_and_update(
+                    direction, o_price, h_price, l_price, close,
+                    delta, hawkes_z, is_pre_emptive=is_pre_emptive
+                )
+                
+                if not color_allowed:
+                    print(f"  [{self.timeframe}] ⚠️ ABSORPTION (P112): {color_reason}. CPR={cpr_val:.2f}. Blocking {direction}.")
                     sniper_result["should_trade"] = False
-                elif direction == "SHORT" and is_green and "PRE-EMPTIVE" not in sniper_result.get("reason", ""):
-                    print(f"  [{self.timeframe}] ⚠️ ABSORPTION DETECTED: Sniper wants SHORT but candle is GREEN. Aborting.")
-                    sniper_result["should_trade"] = False
+                elif is_red and direction == "LONG":
+                    print(f"  [{self.timeframe}] 🟢 ABSORPTION BYPASSED (P112): {color_reason}. CPR={cpr_val:.2f} ✅")
+                elif is_green and direction == "SHORT":
+                    print(f"  [{self.timeframe}] 🟢 ABSORPTION BYPASSED (P112): {color_reason}. CPR={cpr_val:.2f} ✅")
 
         if sniper_result["should_trade"]:
             # Phase 66: DYNAMIC DELTA CONFIRMATION GATE (Candle Close Path)
