@@ -1348,7 +1348,6 @@ class TradingBot:
             delta_decelerating = delta > self.prev_delta     # 2nd derivative positive
             
             # Fetch OFI Array for dynamic standard deviation bounds
-            import numpy as np
             recent_ofis = list(self.microstructure.delta_volumes) if hasattr(self.microstructure, 'delta_volumes') and len(self.microstructure.delta_volumes) > 5 else [0.0]
             sigma_ofi = np.std(recent_ofis) if len(recent_ofis) > 1 else 10.0
             
@@ -1365,7 +1364,6 @@ class TradingBot:
             
             # Calculate rolling Z-Score of the Hawkes Arrival Rate
             self.hawkes_buffer.append(h_lambda)
-            import numpy as np
             h_sigma = np.std(self.hawkes_buffer) if len(self.hawkes_buffer) > 10 else 1.0
             h_mu = np.mean(self.hawkes_buffer) if len(self.hawkes_buffer) > 10 else h_lambda
             h_zscore = (h_lambda - h_mu) / max(0.01, h_sigma)
@@ -1401,7 +1399,6 @@ class TradingBot:
             # 2. Phase 64: Exhaustion Reversion (adaptive OFI & Hawkes Kinetics)
             delta_decelerating = delta < self.prev_delta
             
-            import numpy as np
             recent_ofis = list(self.microstructure.delta_volumes) if hasattr(self.microstructure, 'delta_volumes') and len(self.microstructure.delta_volumes) > 5 else [0.0]
             sigma_ofi = np.std(recent_ofis) if len(recent_ofis) > 1 else 10.0
             
@@ -1417,7 +1414,6 @@ class TradingBot:
             
             # Calculate rolling Z-Score of the Hawkes Arrival Rate
             self.hawkes_buffer.append(h_lambda)
-            import numpy as np
             h_sigma = np.std(self.hawkes_buffer) if len(self.hawkes_buffer) > 10 else 1.0
             h_mu = np.mean(self.hawkes_buffer) if len(self.hawkes_buffer) > 10 else h_lambda
             h_zscore = (h_lambda - h_mu) / max(0.01, h_sigma)
