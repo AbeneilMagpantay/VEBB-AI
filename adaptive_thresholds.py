@@ -392,6 +392,20 @@ class AdaptiveHawkesEWMA:
         hawkes_z = (h_lambda - self._hawkes_ewma_mu) / sigma
         return float(hawkes_z)
 
+    def get_state(self) -> dict:
+        return {
+            "lambda_history": list(self.lambda_history),
+            "mu": self._hawkes_ewma_mu,
+            "var": self._hawkes_ewma_var,
+            "initialized": self._initialized
+        }
+
+    def set_state(self, state: dict):
+        self.lambda_history = deque(state.get("lambda_history", []), maxlen=self.n + 1)
+        self._hawkes_ewma_mu = state.get("mu", 0.0)
+        self._hawkes_ewma_var = state.get("var", 0.0)
+        self._initialized = state.get("initialized", False)
+
 
 class AdaptiveBreakoutDetector:
     """
@@ -426,6 +440,12 @@ class AdaptiveBreakoutDetector:
 
         return is_breakout, dynamic_threshold
 
+    def get_state(self) -> dict:
+        return {"z_buffer": list(self.z_buffer)}
+
+    def set_state(self, state: dict):
+        self.z_buffer = deque(state.get("z_buffer", []), maxlen=self.buffer_size)
+
 
 class AdaptiveTFIThreshold:
     """
@@ -458,6 +478,12 @@ class AdaptiveTFIThreshold:
         self.abs_tfi_buffer.append(abs_tfi)
 
         return is_valid, dynamic_threshold
+
+    def get_state(self) -> dict:
+        return {"abs_tfi_buffer": list(self.abs_tfi_buffer)}
+
+    def set_state(self, state: dict):
+        self.abs_tfi_buffer = deque(state.get("abs_tfi_buffer", []), maxlen=self.buffer_size)
 
 
 class AdaptiveSigmoidCalibration:
@@ -525,6 +551,16 @@ class AdaptiveSigmoidCalibration:
 
         return float(threshold)
 
+    def get_state(self) -> dict:
+        return {
+            "obi_buffer": list(self.obi_buffer),
+            "z_buffer": list(self.z_buffer)
+        }
+
+    def set_state(self, state: dict):
+        self.obi_buffer = deque(state.get("obi_buffer", []), maxlen=self.buffer_size)
+        self.z_buffer = deque(state.get("z_buffer", []), maxlen=self.buffer_size)
+
 
 class AdaptiveMultipliers:
     """
@@ -578,6 +614,24 @@ class AdaptiveMultipliers:
         self._update_buffer(self.hurst_sorted, self.hurst_queue, current_hurst)
 
         return float(rv_mult), float(hurst_mult)
+
+    def get_state(self) -> dict:
+        return {
+            "rv_queue": list(self.rv_queue),
+            "hurst_queue": list(self.hurst_queue)
+        }
+
+    def set_state(self, state: dict):
+        rv_data = state.get("rv_queue", [])
+        hurst_data = state.get("hurst_queue", [])
+        self.rv_queue = deque(maxlen=self.buffer_size)
+        self.rv_sorted = []
+        self.hurst_queue = deque(maxlen=self.buffer_size)
+        self.hurst_sorted = []
+        for v in rv_data:
+            self._update_buffer(self.rv_sorted, self.rv_queue, v)
+        for v in hurst_data:
+            self._update_buffer(self.hurst_sorted, self.hurst_queue, v)
 
 
 class AdaptiveCPR:
@@ -653,3 +707,13 @@ class AdaptiveCPR:
         self.delta_buffer.append(abs(delta))
 
         return should_allow, reason, cpr
+
+    def get_state(self) -> dict:
+        return {
+            "cpr_buffer": list(self.cpr_buffer),
+            "delta_buffer": list(self.delta_buffer)
+        }
+
+    def set_state(self, state: dict):
+        self.cpr_buffer = deque(state.get("cpr_buffer", []), maxlen=self.buffer_size)
+        self.delta_buffer = deque(state.get("delta_buffer", []), maxlen=self.buffer_size)

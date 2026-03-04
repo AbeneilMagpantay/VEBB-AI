@@ -29,6 +29,7 @@ from adaptive_thresholds import (AdaptiveRegimeDetector as AdaptiveRegime, Adapt
     AdaptiveTrendBreakout, AdaptiveMeanReversion,
     AdaptiveHawkesEWMA, AdaptiveBreakoutDetector, AdaptiveTFIThreshold,
     AdaptiveSigmoidCalibration, AdaptiveMultipliers, AdaptiveCPR)
+from cold_start_manager import ColdStartManager  # Phase 113: State Persistence
 from sentinel_detector import SentinelLeadLagDetector
 from liquidity_magnet import LiquidationMagnetDetector
 from volatility_tp import DynamicVolatilityEngine
@@ -623,6 +624,17 @@ class TradingBot:
         self.adaptive_sigmoid = AdaptiveSigmoidCalibration(buffer_size=96)
         self.adaptive_mults = AdaptiveMultipliers(buffer_size=96)
         self.adaptive_cpr = AdaptiveCPR(buffer_size=96)  # Phase 112: CPR + Delta Override
+        
+        # Phase 113: Cold-Start Manager + adaptive class registry
+        self.cold_start = ColdStartManager(state_dir=".")
+        self._adaptive_registry = {
+            'adaptive_ewma': self.adaptive_hawkes,
+            'adaptive_breakout': self.adaptive_breakout,
+            'adaptive_tfi': self.adaptive_tfi,
+            'adaptive_sigmoid': self.adaptive_sigmoid,
+            'adaptive_mults': self.adaptive_mults,
+            'adaptive_cpr': self.adaptive_cpr,
+        }
         self.candle_count = 0  # Running index for CB time-lock
         self.vol_floor = 2.0 # Minimum theta threshold (scaled by Gemini)
         self.last_macro_update_ts = datetime.min
@@ -758,6 +770,10 @@ class TradingBot:
         
         # 2. Warmup Phase: REST Preload for HMM/Indicators
         await self._preload_candles()
+        
+        # 2b. Phase 113: Cold-Start Initialization
+        base_url = "https://testnet.binancefuture.com" if self.testnet else "https://fapi.binance.com"
+        self.cold_start.initialize(self._adaptive_registry, base_url, self.timeframe)
         
         # 3. Context Phase: Initial Multi-Timeframe Analysis
         await self.multi_tf.update()
@@ -2013,6 +2029,12 @@ class TradingBot:
         
         # Reset footprint for next candle
         self.footprint.reset()
+        
+        # Phase 113: Persist adaptive buffer states after every candle
+        try:
+            self.cold_start.save_state(self._adaptive_registry)
+        except Exception as e:
+            print(f"  [{self.timeframe}] ⚠️ Phase 113 state save failed: {e}")
         
         # Execute if confident AND matches sniper direction
         executed = False
