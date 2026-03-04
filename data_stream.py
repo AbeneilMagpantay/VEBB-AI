@@ -260,6 +260,80 @@ def calculate_garman_klass(candle: dict) -> float:
     return np.sqrt(max(gk_var, 0))  # Ensure non-negative
 
 
+def calculate_yang_zhang(candle_buffer, window: int = 20) -> float:
+    """
+    Phase 115: Yang-Zhang Volatility Estimator (replaces Garman-Klass).
+    
+    Decomposes variance into three components:
+    1. Overnight (close-to-open) — captures virtual gaps, API disconnects
+    2. Open-to-close (trend) — directional drift component
+    3. Rogers-Satchell (intraday) — drift-independent extreme excursions
+    
+    Combined via variance-minimizing weight k derived from α=1.34.
+    Requires N≥2 candles. Falls back to GK for insufficient buffer.
+    """
+    n = len(candle_buffer)
+    if n < 2:
+        # Fallback to single-candle GK when buffer is too small
+        return calculate_garman_klass(candle_buffer[-1])
+    
+    # Use at most `window` recent candles
+    start = max(0, n - window)
+    candles = [candle_buffer[i] for i in range(start, n)]
+    N = len(candles)
+    
+    if N < 2:
+        return calculate_garman_klass(candles[-1])
+    
+    # Normalized log prices (skip first candle for overnight component)
+    log_oc = []  # Overnight: ln(Open_i / Close_{i-1})
+    log_ho = []  # ln(High / Open)
+    log_lo = []  # ln(Low / Open)
+    log_co = []  # ln(Close / Open)
+    
+    for i in range(1, N):
+        prev_close = candles[i - 1]["close"]
+        o, h, l, c = candles[i]["open"], candles[i]["high"], candles[i]["low"], candles[i]["close"]
+        
+        if prev_close <= 0 or o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            continue
+        
+        log_oc.append(np.log(o / prev_close))
+        log_ho.append(np.log(h / o))
+        log_lo.append(np.log(l / o))
+        log_co.append(np.log(c / o))
+    
+    n_valid = len(log_oc)
+    if n_valid < 2:
+        return calculate_garman_klass(candle_buffer[-1])
+    
+    log_oc = np.array(log_oc)
+    log_ho = np.array(log_ho)
+    log_lo = np.array(log_lo)
+    log_co = np.array(log_co)
+    
+    # Component 1: Overnight variance (close-to-open)
+    oc_mean = np.mean(log_oc)
+    sigma_o_sq = np.sum((log_oc - oc_mean) ** 2) / (n_valid - 1)
+    
+    # Component 2: Open-to-close variance (trend)
+    co_mean = np.mean(log_co)
+    sigma_c_sq = np.sum((log_co - co_mean) ** 2) / (n_valid - 1)
+    
+    # Component 3: Rogers-Satchell variance (drift-independent intraday)
+    rs_terms = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+    sigma_rs_sq = np.mean(rs_terms)
+    
+    # Variance minimization weight k (α=1.34 from Yang & Zhang 2000 proof)
+    alpha = 1.34
+    k = (alpha - 1.0) / (alpha + (n_valid + 1.0) / (n_valid - 1.0))
+    
+    # Combined Yang-Zhang variance
+    yz_var = sigma_o_sq + k * sigma_c_sq + (1.0 - k) * sigma_rs_sq
+    
+    return float(np.sqrt(max(yz_var, 0)))
+
+
 def calculate_log_return(close: float, prev_close: float) -> float:
     """Computes log return between two closes."""
     if prev_close <= 0:

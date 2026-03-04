@@ -350,43 +350,38 @@ class AdaptiveMeanReversion:
 
 class AdaptiveHawkesEWMA:
     """
-    Phase 111: Replaces fixed gamma=0.05 EWMA with Kaufman Efficiency
-    Ratio-driven adaptive smoothing. Responds instantly to clean breakouts
-    (ER→1, gamma→0.44) and suppresses noise during chop (ER→0, gamma→0.004).
+    Phase 115: Fixed-gamma EWMA for Hawkes Z-score.
+    
+    Removed Kaufman Efficiency Ratio (KER) which was DESTRUCTIVE:
+    - During breakouts, price oscillates → KER→0 → gamma→0.004 → FLATLINE
+    - This killed the exact intensity spike the Hawkes process was designed to detect
+    
+    Now uses a fixed fast gamma=0.10 that preserves instantaneous spikes
+    without trend-following phase lag. The Deep Research confirmed that
+    institutional Hawkes implementations avoid time-domain smoothers.
     """
 
-    def __init__(self, n: int = 10, fast_len: int = 2, slow_len: int = 30):
+    def __init__(self, n: int = 10, gamma: float = 0.10):
         self.n = n
-        self.sc_fast = 2.0 / (fast_len + 1.0)
-        self.sc_slow = 2.0 / (slow_len + 1.0)
-        self.lambda_history = deque(maxlen=n + 1)
+        self.gamma = gamma  # Fixed fast gamma (no Kaufman ER)
+        self.lambda_history = deque(maxlen=n + 1)  # Kept for state persistence
         self._hawkes_ewma_mu = 0.0
         self._hawkes_ewma_var = 0.0
         self._initialized = False
 
     def update(self, h_lambda: float) -> float:
-        """Update EWMA with adaptive gamma, returns current Hawkes Z-score."""
+        """Update EWMA with fixed gamma, returns current Hawkes Z-score."""
         self.lambda_history.append(h_lambda)
 
-        # Calculate adaptive gamma via Kaufman Efficiency Ratio
-        if len(self.lambda_history) < self.n + 1:
-            gamma = 0.05  # Cold-start fallback
-        else:
-            directional_change = abs(self.lambda_history[-1] - self.lambda_history[0])
-            volatility = sum(abs(self.lambda_history[i] - self.lambda_history[i - 1])
-                             for i in range(1, len(self.lambda_history)))
-            er = directional_change / volatility if volatility != 0.0 else 0.0
-            gamma = (er * (self.sc_fast - self.sc_slow) + self.sc_slow) ** 2
-
-        # Initialize or update EWMA
+        # Initialize or update EWMA (no Kaufman — fixed gamma preserves spikes)
         if not self._initialized:
             self._hawkes_ewma_mu = h_lambda
             self._hawkes_ewma_var = max((h_lambda * 0.1) ** 2, 1.0)
             self._initialized = True
         else:
-            self._hawkes_ewma_mu = gamma * h_lambda + (1 - gamma) * self._hawkes_ewma_mu
-            self._hawkes_ewma_var = gamma * ((h_lambda - self._hawkes_ewma_mu) ** 2) + \
-                                    (1 - gamma) * self._hawkes_ewma_var
+            self._hawkes_ewma_mu = self.gamma * h_lambda + (1 - self.gamma) * self._hawkes_ewma_mu
+            self._hawkes_ewma_var = self.gamma * ((h_lambda - self._hawkes_ewma_mu) ** 2) + \
+                                    (1 - self.gamma) * self._hawkes_ewma_var
 
         sigma = max(self._hawkes_ewma_var ** 0.5, 0.01)
         hawkes_z = (h_lambda - self._hawkes_ewma_mu) / sigma

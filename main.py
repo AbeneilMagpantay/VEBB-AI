@@ -13,7 +13,7 @@ import numpy as np
 from dotenv import load_dotenv
 from collections import deque
 
-from data_stream import DataStream, calculate_garman_klass, calculate_log_return
+from data_stream import DataStream, calculate_garman_klass, calculate_yang_zhang, calculate_log_return
 from regime_detector import RegimeDetector
 from gemini_analyst import GeminiAnalyst, TradeAction, ExitAction, TradeSignal
 from position_manager import PositionManager, Side
@@ -697,8 +697,8 @@ class TradingBot:
                     }
                     self.candle_buffer.append(candle)
                     self.prev_close = candle["close"]
-                    # Phase 61: Feed historical math to prime the localized 24-hr Z-Score window
-                    gk_vol_preload = calculate_garman_klass(candle)
+                    # Phase 115: Use Yang-Zhang volatility (replaces Garman-Klass)
+                    gk_vol_preload = calculate_yang_zhang(self.candle_buffer, window=20)
                     self.regime_detector.update(gk_vol_preload, candle["close"])
                 
                 # Trim to EXACT size (For HMM/Lookbacks)
@@ -1573,7 +1573,8 @@ class TradingBot:
             self.candle_buffer.pop(0)
         
         # Calculate features
-        gk_vol = calculate_garman_klass(candle)
+        # Phase 115: Calculate Yang-Zhang volatility (replaces single-candle GK)
+        gk_vol = calculate_yang_zhang(self.candle_buffer, window=20)
         log_ret = calculate_log_return(close, self.prev_close or close)
         self.prev_close = close
         
