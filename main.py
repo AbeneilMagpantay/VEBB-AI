@@ -1566,6 +1566,16 @@ class TradingBot:
         self.delta_threshold.feed_candle_cvd(candle_abs_cvd)
         self.delta_threshold.reset_candle(self.microstructure.hawkes_lambda)
 
+        # Phase 110: Update EWMA Hawkes Z-score on EVERY candle close (not just Sniper fires)
+        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
+        if not hasattr(self, '_hawkes_ewma_mu'):
+            self._hawkes_ewma_mu = h_lambda
+            self._hawkes_ewma_var = max((h_lambda * 0.1) ** 2, 1.0)  # Bootstrap σ at 10% of first value
+        gamma_h = 0.05
+        self._hawkes_ewma_mu = gamma_h * h_lambda + (1 - gamma_h) * self._hawkes_ewma_mu
+        self._hawkes_ewma_var = gamma_h * (h_lambda - self._hawkes_ewma_mu) ** 2 + (1 - gamma_h) * self._hawkes_ewma_var
+        self._hawkes_z = (h_lambda - self._hawkes_ewma_mu) / max(self._hawkes_ewma_var ** 0.5, 0.01)
+
         # Phase 48: Dynamic TP Volatility Tracking
         self.vol_buffer.append(gk_vol)
         if len(self.vol_buffer) > 20:
@@ -1860,18 +1870,9 @@ class TradingBot:
             self.footprint.reset()
             return
 
-        # 2. Phase 110: Detect Breakout Regime using EWMA-normalized Hawkes Z-score
-        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
-        
-        # EWMA normalization (fixes overflow bug: raw intensity ≠ Z-score)
-        if not hasattr(self, '_hawkes_ewma_mu'):
-            self._hawkes_ewma_mu = h_lambda
-            self._hawkes_ewma_var = 1.0
-        gamma = 0.05  # Smoothing factor (~20 sample effective window)
-        self._hawkes_ewma_mu = gamma * h_lambda + (1 - gamma) * self._hawkes_ewma_mu
-        self._hawkes_ewma_var = gamma * (h_lambda - self._hawkes_ewma_mu) ** 2 + (1 - gamma) * self._hawkes_ewma_var
-        hawkes_sigma = max(self._hawkes_ewma_var ** 0.5, 0.01)
-        hawkes_z = (h_lambda - self._hawkes_ewma_mu) / hawkes_sigma
+        # 2. Phase 110: Detect Breakout Regime using pre-computed EWMA Hawkes Z-score
+        # (EWMA updates on every candle close in main loop, so Z has full history)
+        hawkes_z = getattr(self, '_hawkes_z', 0.0)
         
         # Breakout conditions: Hawkes Z > 2.0, |Delta| > rolling P90, HTF aligned
         delta_p90 = float(np.percentile(list(self.adaptive_trend.delta_history), 90)) if len(self.adaptive_trend.delta_history) > 20 else 500.0
