@@ -1839,32 +1839,16 @@ class TradingBot:
         print(f"  [{self.timeframe}] 🔬 Micro: OFI={micro_metrics.ofi:+.2f}, Iceberg={micro_metrics.iceberg_score:.2f}, Intensity={micro_metrics.intensity:.1f}")
         
         # =================================================================
-        # PREDATOR MODE: DYNAMIC OBI & SPOOFING GUARD (Phase 35/40)
+        # PREDATOR MODE: Context-Aware Metric Substitution (Phase 110)
         # =================================================================
+        # Research: OBI structurally inverts during breakouts (market makers
+        # replenish asks during bull runs). During momentum regimes, we
+        # substitute OBI with Trade Flow Imbalance (TFI) which measures
+        # aggressive executed flow, not passive resting liquidity.
         
-        # 0. CONTINUOUS AGGRESSION ENGINE (Phase 48)
-        # Instead of discrete steps, we use a logistical function for Delta
-        # high delta -> low base threshold
-        abs_delta = abs(delta)
-        BASE_THRESHOLD = 0.85 / (1.0 + (abs_delta / 60.0))
-        mom_desc = "SCALER"
-
-        # Calculate Truly Adaptive OBI Threshold (Phase 48 Multi-Factor)
-        PREDATOR_OBI_THRESHOLD = self.microstructure.get_adaptive_threshold(
-            BASE_THRESHOLD, 
-            gk_vol, 
-            hurst,
-            intensity=micro_metrics.intensity,
-            iceberg=micro_metrics.iceberg_score
-        )
-        if PREDATOR_OBI_THRESHOLD != BASE_THRESHOLD:
-            print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI: {BASE_THRESHOLD:.2f} -> {PREDATOR_OBI_THRESHOLD:.2f} (RV={gk_vol:.4f}, H={hurst:.2f}, Int={micro_metrics.intensity:.0f})")
-
         direction = sniper_result["direction"]
         
-        # 1. SPOOFING GUARD: Hollow Wall Detection (Research-backed)
-        # If Top OBI is strong but Macro OBI thins out, it's a "Hollow Wall" (Spoofing)
-        # We require Macro OBI to be at least 90% as strong as Top OBI for "Full Market Alignment"
+        # 1. SPOOFING GUARD: Hollow Wall Detection (ALWAYS runs first)
         is_hollow = False
         if direction == "LONG" and top_obi > 0.3:
             if current_obi < (top_obi * 0.9): is_hollow = True
@@ -1876,17 +1860,78 @@ class TradingBot:
             self.footprint.reset()
             return
 
-        # 2. PREDATOR THRESHOLD CHECK
-        if direction == "LONG" and current_obi < PREDATOR_OBI_THRESHOLD:
-            dir_msg = "Wrong side" if current_obi < 0 else "Too weak"
-            print(f"  [{self.timeframe}] ⏸️ Predator Filter: OBI {current_obi:.2f} ({dir_msg}) for LONG ({mom_desc} mom needs {PREDATOR_OBI_THRESHOLD})")
-            self.footprint.reset()
-            return
-        elif direction == "SHORT" and current_obi > -PREDATOR_OBI_THRESHOLD:
-            dir_msg = "Wrong side" if current_obi > 0 else "Too weak"
-            print(f"  [{self.timeframe}] ⏸️ Predator Filter: OBI {current_obi:.2f} ({dir_msg}) for SHORT ({mom_desc} mom needs -{PREDATOR_OBI_THRESHOLD})")
-            self.footprint.reset()
-            return
+        # 2. Phase 110: Detect Breakout Regime using EWMA-normalized Hawkes Z-score
+        h_lambda = getattr(self.microstructure, 'hawkes_lambda', 0.0)
+        
+        # EWMA normalization (fixes overflow bug: raw intensity ≠ Z-score)
+        if not hasattr(self, '_hawkes_ewma_mu'):
+            self._hawkes_ewma_mu = h_lambda
+            self._hawkes_ewma_var = 1.0
+        gamma = 0.05  # Smoothing factor (~20 sample effective window)
+        self._hawkes_ewma_mu = gamma * h_lambda + (1 - gamma) * self._hawkes_ewma_mu
+        self._hawkes_ewma_var = gamma * (h_lambda - self._hawkes_ewma_mu) ** 2 + (1 - gamma) * self._hawkes_ewma_var
+        hawkes_sigma = max(self._hawkes_ewma_var ** 0.5, 0.01)
+        hawkes_z = (h_lambda - self._hawkes_ewma_mu) / hawkes_sigma
+        
+        # Breakout conditions: Hawkes Z > 2.0, |Delta| > rolling P90, HTF aligned
+        delta_p90 = float(np.percentile(list(self.adaptive_trend.delta_history), 90)) if len(self.adaptive_trend.delta_history) > 20 else 500.0
+        
+        is_htf_aligned = (
+            (direction == "LONG" and htf_bias in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]) or
+            (direction == "SHORT" and htf_bias in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH])
+        )
+        
+        is_breakout_regime = (hawkes_z > 2.0) and (abs(delta) > delta_p90) and is_htf_aligned
+        
+        # 3. METRIC SUBSTITUTION: TFI during breakouts, OBI during ranging
+        if is_breakout_regime:
+            # Trade Flow Imbalance (aggressive executed volume, not passive book)
+            vol_buy = self.footprint.current.total_buy_volume
+            vol_sell = self.footprint.current.total_sell_volume
+            total_vol = vol_buy + vol_sell
+            
+            if total_vol > 0:
+                if direction == "LONG":
+                    tfi = (vol_buy - vol_sell) / total_vol
+                else:
+                    tfi = (vol_sell - vol_buy) / total_vol
+                
+                tfi_threshold = 0.40  # Research recommends 0.60, softened to 0.40 for early entries
+                
+                if tfi >= tfi_threshold:
+                    print(f"  [{self.timeframe}] 🔥 PREDATOR BYPASS (Phase 110): Breakout regime (Hz={hawkes_z:.1f}, Δ={delta:.0f}>{delta_p90:.0f}). TFI={tfi:.2f} ≥ {tfi_threshold} ✅")
+                else:
+                    print(f"  [{self.timeframe}] ⏸️ Predator Filter (TFI Mode): TFI {tfi:.2f} < {tfi_threshold} despite breakout regime. Blocking {direction}.")
+                    self.footprint.reset()
+                    return
+            else:
+                print(f"  [{self.timeframe}] ⏸️ Predator Filter: Zero volume in breakout — low liquidity fakeout. Blocking.")
+                self.footprint.reset()
+                return
+        else:
+            # Standard OBI evaluation for non-breakout regimes
+            abs_delta = abs(delta)
+            BASE_THRESHOLD = 0.85 / (1.0 + (abs_delta / 60.0))
+            
+            # Fix: Pass EWMA-normalized Hawkes Z instead of raw intensity
+            PREDATOR_OBI_THRESHOLD = self.microstructure.get_adaptive_threshold(
+                BASE_THRESHOLD, gk_vol, hurst,
+                intensity=hawkes_z,  # Phase 110: Corrected — now passes Z-score, not raw λ
+                iceberg=micro_metrics.iceberg_score
+            )
+            if PREDATOR_OBI_THRESHOLD != BASE_THRESHOLD:
+                print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI: {BASE_THRESHOLD:.2f} -> {PREDATOR_OBI_THRESHOLD:.2f} (RV={gk_vol:.4f}, H={hurst:.2f}, Hz={hawkes_z:.1f})")
+            
+            if direction == "LONG" and current_obi < PREDATOR_OBI_THRESHOLD:
+                dir_msg = "Wrong side" if current_obi < 0 else "Too weak"
+                print(f"  [{self.timeframe}] ⏸️ Predator Filter: OBI {current_obi:.2f} ({dir_msg}) for LONG (needs {PREDATOR_OBI_THRESHOLD:.2f})")
+                self.footprint.reset()
+                return
+            elif direction == "SHORT" and current_obi > -PREDATOR_OBI_THRESHOLD:
+                dir_msg = "Wrong side" if current_obi > 0 else "Too weak"
+                print(f"  [{self.timeframe}] ⏸️ Predator Filter: OBI {current_obi:.2f} ({dir_msg}) for SHORT (needs -{PREDATOR_OBI_THRESHOLD:.2f})")
+                self.footprint.reset()
+                return
 
         # Phase 105: Construct deterministic TradeSignal from Sniper + Macro Regime
         # (replaces the deleted synchronous Gemini analyze() call)
