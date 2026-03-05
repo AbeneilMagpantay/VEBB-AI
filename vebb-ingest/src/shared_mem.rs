@@ -54,6 +54,9 @@ pub struct MarketState {
     // Phase 102: Dynamic Global Unity Deviation Bounds (Calculated in Rust, atomic u64 fixed point bits)
     pub dynamic_tau_upper: std::sync::atomic::AtomicU64,
     pub dynamic_tau_lower: std::sync::atomic::AtomicU64,
+    
+    // Phase 116A: Time-at-Support Absorption Streak (consecutive 1-second windows of DID < 0.002 at high intensity)
+    pub absorption_streak: std::sync::atomic::AtomicU64,
 }
 
 // Phase 81: Zero-Latency Event Bridge
@@ -214,6 +217,7 @@ impl Default for MarketState {
             entropy_z_score: std::sync::atomic::AtomicU64::new(0),
             dynamic_tau_upper: std::sync::atomic::AtomicU64::new(0),
             dynamic_tau_lower: std::sync::atomic::AtomicU64::new(0),
+            absorption_streak: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

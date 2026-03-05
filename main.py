@@ -1177,14 +1177,26 @@ class TradingBot:
             # If DID < 0.002 (e.g. 300 BTC delta on 150k ticks), it is Passive Absorption (Climax)
             if did_ratio < 0.002:
                 # Phase 116A: Time-at-Support Absorption Tracker
-                # Track consecutive candles of absorption near the same price level
+                # Track consecutive candles of absorption near the same price level (15m fallback)
                 tracker = self._absorption_tracker
                 if tracker['anchor_price'] > 0 and abs(price - tracker['anchor_price']) / tracker['anchor_price'] < tracker['price_tolerance']:
                     tracker['count'] += 1
                 else:
                     tracker['count'] = 1
                     tracker['anchor_price'] = price
-                sustained_absorption = tracker['count'] >= 2  # 30+ min of holding
+                
+                # Phase 116A.1: Prefer Rust-side 1-second DID streak over 15m candle counter
+                shm_state = self.shm_reader.read()
+                if shm_state and hasattr(shm_state, 'absorption_streak') and shm_state.absorption_streak > 0:
+                    sustained_absorption = shm_state.absorption_streak >= 180  # 180 seconds = 3 minutes
+                    if sustained_absorption:
+                        import time as _time
+                        _now = _time.time()
+                        if _now - getattr(self, '_last_abs_streak_log', 0) > 30:
+                            print(f"  [{self.timeframe} ⏱️] ABSORPTION TRACKER (Rust): {shm_state.absorption_streak}s sustained at ${price:,.0f}")
+                            self._last_abs_streak_log = _now
+                else:
+                    sustained_absorption = tracker['count'] >= 2  # Fallback: 30+ min of holding
                 
                 # Phase 116A: Context-Aware Exhaustion Guard Override
                 # At DISCOUNT + HTF bullish + positive global delta, absorption = institutional buying = ENTRY

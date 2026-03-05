@@ -46,7 +46,10 @@ class MarketState(ctypes.Structure):
         
         # Phase 102: Dynamic Global Unity Deviation Bounds
         ("dynamic_tau_upper", ctypes.c_uint64),
-        ("dynamic_tau_lower", ctypes.c_uint64)
+        ("dynamic_tau_lower", ctypes.c_uint64),
+        
+        # Phase 116A: Time-at-Support Absorption Streak
+        ("absorption_streak", ctypes.c_uint64)
     ]
 
 class SHMReader:

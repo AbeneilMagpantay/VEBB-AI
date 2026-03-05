@@ -505,6 +505,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut global_delta_m2: f64 = 0.0;
     let mut global_vol_sum: f64 = 0.0;
     
+    // Phase 116A: Rolling 1-second DID Absorption Tracker
+    let mut abs_last_global_delta: f64 = 0.0;  // Snapshot of global_raw_delta at last 1s check
+    let mut abs_last_global_vol: f64 = 0.0;    // Snapshot of global_raw_volume at last 1s check
+    let mut last_abs_check_ts = Utc::now();
+    let mut absorption_streak: u32 = 0;         // Consecutive 1s windows of absorption
+    let mut absorption_anchor_price: f64 = 0.0; // Price where streak started
+    
     // Math & Flush Loop: Every 10ms
     loop {
         {
@@ -635,6 +642,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_baseline_update_ts = now;
             }
             
+            // Phase 116A: 1-second DID Absorption Check
+            let now_abs = Utc::now();
+            if (now_abs - last_abs_check_ts).num_milliseconds() >= 1000 {
+                let current_raw_delta = s.binance_delta + s.bybit_delta + s.coinbase_delta;
+                let current_raw_vol = s.binance_vol + s.bybit_vol + s.coinbase_vol;
+                
+                let delta_1s = (current_raw_delta - abs_last_global_delta).abs();
+                let vol_1s = current_raw_vol - abs_last_global_vol;
+                
+                let did_1s = if vol_1s > 0.0 { delta_1s / vol_1s } else { 1.0 };
+                
+                // Absorption: DID < 0.002 at intensity > 2.5 BTC/sec (150k ticks/min equivalent)
+                if did_1s < 0.002 && vol_1s > 2.5 {
+                    let current_price = s.binance_price;
+                    // Check if within 0.5% of anchor price (same level)
+                    if absorption_anchor_price > 0.0
+                       && ((current_price - absorption_anchor_price).abs() / absorption_anchor_price) < 0.005 {
+                        absorption_streak += 1;
+                    } else {
+                        absorption_streak = 1;
+                        absorption_anchor_price = current_price;
+                    }
+                } else {
+                    absorption_streak = 0;
+                    absorption_anchor_price = 0.0;
+                }
+                
+                // Update snapshots for next 1-second window
+                abs_last_global_delta = current_raw_delta;
+                abs_last_global_vol = current_raw_vol;
+                last_abs_check_ts = now_abs;
+            }
+            
             // Phase 102: EWMV Step for Dynamic Global Unity Deviation
             let current_global_delta = s.binance_delta + s.bybit_delta + s.coinbase_delta;
             let current_global_vol = s.binance_vol + s.bybit_vol + s.coinbase_vol;
@@ -720,6 +760,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Direct Atomic Store
                 (*ptr).dynamic_tau_upper.store(tau_upper.to_bits(), std::sync::atomic::Ordering::Release);
                 (*ptr).dynamic_tau_lower.store(tau_lower.to_bits(), std::sync::atomic::Ordering::Release);
+                
+                // Phase 116A: Write absorption streak to SHM
+                (*ptr).absorption_streak.store(absorption_streak as u64, std::sync::atomic::Ordering::Release);
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
