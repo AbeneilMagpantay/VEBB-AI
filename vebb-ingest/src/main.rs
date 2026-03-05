@@ -859,7 +859,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pending = (*ptr).exec_signal_type.load(std::sync::atomic::Ordering::Acquire);
                 let now_signal = Utc::now();
                 let cooldown_ok = (now_signal - last_exec_signal_ts).num_milliseconds() >= exec_cooldown_ms;
-                let can_signal = cooldown_ok && (pending == 0 || ack != 0);
+                let can_signal = cooldown_ok && hawkes_buffer.len() >= 6000 && (pending == 0 || ack != 0);
                 
                 if can_signal {
                     // BREAKOUT trigger: Hawkes P95+ AND accelerating AND OFI aligned
