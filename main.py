@@ -668,6 +668,19 @@ class TradingBot:
         self.data_stream.on_depth_update = self._on_depth_update
         self.footprint.on_trade = self._on_footprint_trade
         self.prev_delta = 0.0 # Track previous candle delta for deceleration
+        
+        # Phase 116A: Context-Aware Filter State
+        self._global_delta_candle = 0.0   # Global synthetic delta for current candle
+        self._htf_bias = None             # HTF bias enum for current candle
+        self._current_vp_context = 'FAIR_VALUE'  # Volume profile zone context
+        self._p116a_override_active = False       # Flag for probe sizing
+        
+        # Phase 116A: Time-at-Support Absorption Tracker
+        self._absorption_tracker = {
+            'count': 0,            # Consecutive absorption candles
+            'anchor_price': 0.0,   # Price where absorption started
+            'price_tolerance': 0.005  # 0.5% band for "same level"
+        }
     
     async def _preload_candles(self):
         """Fetch recent historical candles via REST API to avoid warmup delay."""
@@ -1163,25 +1176,63 @@ class TradingBot:
             did_ratio = abs(delta) / intensity if intensity > 0 else 0
             # If DID < 0.002 (e.g. 300 BTC delta on 150k ticks), it is Passive Absorption (Climax)
             if did_ratio < 0.002:
-                # Phase 106: Macro Bias Override — allow entry if Gemini's async macro bias
-                # aligns with the intended direction. High-intensity absorption + macro alignment
-                # = institutional accumulation, NOT distribution.
-                macro_bias = getattr(self.current_macro_regime, 'bias', 'NEUTRAL')
-                intended_dir = "LONG" if delta > 0 else "SHORT"
-                macro_aligned = (
-                    (intended_dir == "LONG" and macro_bias == "BULLISH") or
-                    (intended_dir == "SHORT" and macro_bias == "BEARISH")
-                )
-                if not macro_aligned:
-                    result["reason"] = f"Exhaustion Guard: Passive Absorption Climax (Int={intensity:.0f}, DID={did_ratio:.4f})"
-                    return result
+                # Phase 116A: Time-at-Support Absorption Tracker
+                # Track consecutive candles of absorption near the same price level
+                tracker = self._absorption_tracker
+                if tracker['anchor_price'] > 0 and abs(price - tracker['anchor_price']) / tracker['anchor_price'] < tracker['price_tolerance']:
+                    tracker['count'] += 1
                 else:
+                    tracker['count'] = 1
+                    tracker['anchor_price'] = price
+                sustained_absorption = tracker['count'] >= 2  # 30+ min of holding
+                
+                # Phase 116A: Context-Aware Exhaustion Guard Override
+                # At DISCOUNT + HTF bullish + positive global delta, absorption = institutional buying = ENTRY
+                # At PREMIUM + HTF bearish + negative global delta, absorption = distribution = SHORT ENTRY
+                vp_ctx = self._current_vp_context
+                htf = self._htf_bias
+                g_delta = self._global_delta_candle
+                
+                from multi_tf import TrendDirection
+                htf_bullish = htf in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH] if htf else False
+                htf_bearish = htf in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH] if htf else False
+                
+                # Triple confluence override for LONG
+                p116a_long_override = (vp_ctx == "DISCOUNT" and htf_bullish and g_delta > 0)
+                # Triple confluence override for SHORT  
+                p116a_short_override = (vp_ctx == "PREMIUM" and htf_bearish and g_delta < 0)
+                # Sustained absorption override (single-condition, time proves the iceberg)
+                p116a_sustained = sustained_absorption and (vp_ctx in ["DISCOUNT", "PREMIUM"])
+                
+                if p116a_long_override or p116a_short_override or p116a_sustained:
+                    self._p116a_override_active = True
+                    override_reason = "Triple Confluence" if (p116a_long_override or p116a_short_override) else f"Sustained Absorption ({tracker['count']} candles)"
                     import time as _time
                     _now = _time.time()
-                    if _now - getattr(self, '_last_macro_bypass_log', 0) > 60:
-                        print(f"  [{self.timeframe} 🟢] EXHAUSTION GUARD BYPASSED: Macro {macro_bias} aligns with {intended_dir} (Phase 106)")
-                        self._last_macro_bypass_log = _now
+                    if _now - getattr(self, '_last_p116a_log', 0) > 30:
+                        print(f"  [{self.timeframe} 🟢] EXHAUSTION GUARD OVERRIDE (P116A): {override_reason} | Zone={vp_ctx}, HTF={'Bull' if htf_bullish else 'Bear' if htf_bearish else 'N/A'}, GDelta={g_delta:+.1f}")
+                        self._last_p116a_log = _now
+                else:
+                    # Fallback: Phase 106 Macro Bias Override
+                    macro_bias = getattr(self.current_macro_regime, 'bias', 'NEUTRAL')
+                    intended_dir = "LONG" if delta > 0 else "SHORT"
+                    macro_aligned = (
+                        (intended_dir == "LONG" and macro_bias == "BULLISH") or
+                        (intended_dir == "SHORT" and macro_bias == "BEARISH")
+                    )
+                    if not macro_aligned:
+                        result["reason"] = f"Exhaustion Guard: Passive Absorption Climax (Int={intensity:.0f}, DID={did_ratio:.4f})"
+                        return result
+                    else:
+                        import time as _time
+                        _now = _time.time()
+                        if _now - getattr(self, '_last_macro_bypass_log', 0) > 60:
+                            print(f"  [{self.timeframe} 🟢] EXHAUSTION GUARD BYPASSED: Macro {macro_bias} aligns with {intended_dir} (Phase 106)")
+                            self._last_macro_bypass_log = _now
             else:
+                # Reset absorption tracker when DID validates a breakout (not absorption)
+                self._absorption_tracker['count'] = 0
+                self._absorption_tracker['anchor_price'] = 0.0
                 # Rate limit the print statement to avoid console deadlock during live ticks
                 import time as _time
                 _now = _time.time()
@@ -1368,6 +1419,23 @@ class TradingBot:
             sellers_exhausted = self.adaptive_mr.is_sellers_exhausted(cvd_z_score)
             
             standard_long = (delta > 1.0) and (obi_fused >= obi_thresh_long) and price_extended_long and sellers_exhausted
+            
+            # Phase 116A: Triple Confluence Reversion Relaxation
+            # When DISCOUNT + HTF bullish + positive global delta > 200, relax OBI/CVD requirements
+            from multi_tf import TrendDirection
+            _htf = self._htf_bias
+            _htf_bull = _htf in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH] if _htf else False
+            _g_delta = self._global_delta_candle
+            p116a_confluence_long = (vp_context == "DISCOUNT" and _htf_bull and _g_delta > 200)
+            
+            if p116a_confluence_long and not standard_long:
+                # Relaxed entry: drop strict OBI and CVD requirements
+                # Still require price_extended_long and delta > 1.0 to avoid random entries
+                relaxed_long = (delta > 1.0 or _g_delta > 500) and obi_fused > -0.20 and price_extended_long
+                if relaxed_long:
+                    standard_long = True  # Promote to standard entry path
+                    self._p116a_override_active = True
+                    print(f"  [{self.timeframe} 🟢] P116A REVERSION RELAXED: DISCOUNT + HTF Bull + GDelta={_g_delta:+.0f}. OBI={obi_fused:.2f} (relaxed from {obi_thresh_long:.2f})")
 
             # 2. Phase 64: Exhaustion Reversion (adaptive OFI & Hawkes Kinetics)
             delta_decelerating = delta > self.prev_delta     # 2nd derivative positive
@@ -1420,6 +1488,20 @@ class TradingBot:
             buyers_exhausted = cvd_z_score < 1.5  # Symmetric (not adaptive for short side exhaustion)
             
             standard_short = (delta < -1.0) and (obi_fused <= (1 - obi_thresh_short)) and price_extended_short and buyers_exhausted
+            
+            # Phase 116A: Triple Confluence Reversion Relaxation (SHORT mirror)
+            from multi_tf import TrendDirection
+            _htf = self._htf_bias
+            _htf_bear = _htf in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH] if _htf else False
+            _g_delta = self._global_delta_candle
+            p116a_confluence_short = (vp_context == "PREMIUM" and _htf_bear and _g_delta < -200)
+            
+            if p116a_confluence_short and not standard_short:
+                relaxed_short = (delta < -1.0 or _g_delta < -500) and obi_fused < 0.20 and price_extended_short
+                if relaxed_short:
+                    standard_short = True
+                    self._p116a_override_active = True
+                    print(f"  [{self.timeframe} 🟢] P116A REVERSION RELAXED: PREMIUM + HTF Bear + GDelta={_g_delta:+.0f}. OBI={obi_fused:.2f} (relaxed from {obi_thresh_short:.2f})")
 
             # 2. Phase 64: Exhaustion Reversion (adaptive OFI & Hawkes Kinetics)
             delta_decelerating = delta < self.prev_delta
@@ -1664,6 +1746,10 @@ class TradingBot:
         local_delta = self.footprint.current.cumulative_delta
         delta = global_delta_synthetic # Single Source of Truth for logical engines
         vp_context = self.volume_profile.get_context(close)
+        
+        # Phase 116A: Store state for context-aware filter overrides
+        self._global_delta_candle = global_delta_synthetic
+        self._current_vp_context = vp_context
         footprint_text = self.footprint.format_for_gemini()
         
         # Phase 109: Adaptive Circuit Breaker (Hawkes intensity + Delta directional context)
@@ -1711,6 +1797,7 @@ class TradingBot:
             self.multi_tf.update()
         )
         htf_bias = self.multi_tf.current.overall_bias
+        self._htf_bias = htf_bias  # Phase 116A: Store for context-aware filters
         market_context_text = self.market_context.format_for_gemini()
         mtf_text = self.multi_tf.format_for_gemini()
         
@@ -1968,7 +2055,38 @@ class TradingBot:
                 hawkes_z, current_obi, rv_mult=rv_mult, hurst_mult=hurst_mult,
                 abs_delta=abs(delta)
             )
-            print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI (P111): thresh={PREDATOR_OBI_THRESHOLD:.2f} (Hz={hawkes_z:.1f}, RVm={rv_mult:.2f}, Hm={hurst_mult:.2f})")
+            
+            # Phase 116A: Tiered OBI Threshold Reduction based on cross-exchange delta
+            from multi_tf import TrendDirection
+            abs_g_delta = abs(self._global_delta_candle)
+            _htf = self._htf_bias
+            _htf_bull = _htf in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH] if _htf else False
+            _htf_bear = _htf in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH] if _htf else False
+            vp_ctx = self._current_vp_context
+            
+            obi_discount = 1.0  # No discount by default
+            if direction == "LONG" and vp_ctx == "DISCOUNT" and _htf_bull:
+                if abs_g_delta > 1000:
+                    obi_discount = 0.0   # Tier 3: Extreme global buying, neutral OBI sufficient
+                elif abs_g_delta > 500:
+                    obi_discount = 0.30  # Tier 2: Strong buying
+                elif abs_g_delta > 200:
+                    obi_discount = 0.50  # Tier 1: Moderate buying
+            elif direction == "SHORT" and vp_ctx == "PREMIUM" and _htf_bear:
+                if abs_g_delta > 1000:
+                    obi_discount = 0.0
+                elif abs_g_delta > 500:
+                    obi_discount = 0.30
+                elif abs_g_delta > 200:
+                    obi_discount = 0.50
+            
+            original_threshold = PREDATOR_OBI_THRESHOLD
+            PREDATOR_OBI_THRESHOLD *= obi_discount
+            if obi_discount < 1.0:
+                self._p116a_override_active = True
+                print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI (P111): thresh={original_threshold:.2f} → P116A discount={PREDATOR_OBI_THRESHOLD:.2f} (GDelta={self._global_delta_candle:+.0f}, Zone={vp_ctx})")
+            else:
+                print(f"  [{self.timeframe}] 📉 ADAPTIVE OBI (P111): thresh={PREDATOR_OBI_THRESHOLD:.2f} (Hz={hawkes_z:.1f}, RVm={rv_mult:.2f}, Hm={hurst_mult:.2f})")
             
             if direction == "LONG" and current_obi < PREDATOR_OBI_THRESHOLD:
                 dir_msg = "Wrong side" if current_obi < 0 else "Too weak"
@@ -1998,7 +2116,11 @@ class TradingBot:
         
         # Phase 107: Classify entry type from sniper path
         sniper_reason = sniper_result.get('reason', '')
-        if 'PoNR' in sniper_reason:
+        if self._p116a_override_active:
+            _entry_type = 'Absorption_Reversal'  # Phase 116A: Probe-sized reversal entry
+            self._p116a_override_active = False   # Reset flag
+            print(f"  [{self.timeframe} 🔬] P116A: Entry tagged as Absorption_Reversal (33% probe sizing)")
+        elif 'PoNR' in sniper_reason:
             _entry_type = 'PoNR_Expansion'
         elif sniper_result.get('position', '') in ('DISCOUNT', 'PREMIUM'):
             _entry_type = 'Mean_Reversion'

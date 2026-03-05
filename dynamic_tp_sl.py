@@ -46,6 +46,7 @@ class DynamicExitFramework:
         'Lead_Lag_Alpha':   (0.80, 0.60),  # Transient edge — tight bounds
         'PoNR_Expansion':   (1.20, 1.10),  # Structural VA rejection — moderate
         'Flashpoint':       (1.30, 0.90),  # Mid-candle autonomous — slightly aggressive
+        'Absorption_Reversal': (0.60, 0.70),  # Phase 116A: Probe-sized reversal, scalp to VAL
     }
 
     def __init__(self, kelly_lambda: float = 0.05, gk_vol_baseline: float = 0.005,
