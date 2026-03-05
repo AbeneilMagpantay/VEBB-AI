@@ -147,6 +147,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if bid_vol + ask_vol > 0.0 {
                                     s.binance_nobi = (bid_vol - ask_vol) / (bid_vol + ask_vol);
+                                    // Phase 116.2: Store depth snapshot
+                                    s.binance_bids = bids_ev;
+                                    s.binance_asks = asks_ev;
                                     
                                     // Phase 84/85: Shannon Entropy of Order Book (Chaos Metric)
                                     let total_vol = bid_vol + ask_vol;
@@ -298,6 +301,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if bid_vol + ask_vol > 0.0 {
                                         let mut s = bybit_state.lock().unwrap();
                                         s.bybit_nobi = (bid_vol - ask_vol) / (bid_vol + ask_vol);
+                                        // Phase 116.2: Store depth snapshot
+                                        s.bybit_bids = bids_ev;
+                                        s.bybit_asks = asks_ev;
                                     }
 
                                     // Phase 81: Push Full Snapshot to C++ Bridge
@@ -434,6 +440,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 if bid_vol + ask_vol > 0.0 {
                                     s.coinbase_nobi = (bid_vol - ask_vol) / (bid_vol + ask_vol);
+                                    // Phase 116.2: Store depth snapshot
+                                    s.coinbase_bids = bids_ev;
+                                    s.coinbase_asks = asks_ev;
                                 }
 
                                 // Phase 81: Push Full Snapshot to C++ Bridge
@@ -505,12 +514,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut global_delta_m2: f64 = 0.0;
     let mut global_vol_sum: f64 = 0.0;
     
-    // Phase 116A: Rolling 1-second DID Absorption Tracker
-    let mut abs_last_global_delta: f64 = 0.0;  // Snapshot of global_raw_delta at last 1s check
-    let mut abs_last_global_vol: f64 = 0.0;    // Snapshot of global_raw_volume at last 1s check
+    // Phase 116A → 116.1: Rolling 100ms DID Absorption Tracker (upgraded from 1s)
+    let mut abs_last_global_delta: f64 = 0.0;
+    let mut abs_last_global_vol: f64 = 0.0;
     let mut last_abs_check_ts = Utc::now();
-    let mut absorption_streak: u32 = 0;         // Consecutive 1s windows of absorption
-    let mut absorption_anchor_price: f64 = 0.0; // Price where streak started
+    let mut absorption_streak: u32 = 0;
+    let mut absorption_anchor_price: f64 = 0.0;
+    
+    // Phase 116.1: Hawkes EWMA Intensity Tracker  
+    let mut hawkes_intensity: f64 = 0.0;
+    let mut hawkes_prev_intensity: f64 = 0.0;
+    let hawkes_alpha: f64 = 0.3;      // Jump excitation factor
+    let hawkes_decay: f64 = 0.05;     // Decay per 10ms tick
+    let mut hawkes_buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(6000);
+    let mut last_hawkes_vol: f64 = 0.0;
+    
+    // Phase 116.3: Execution signal cooldown
+    let mut last_exec_signal_ts = Utc::now();
+    let exec_cooldown_ms: i64 = 30000; // 30s cooldown between signals
+    
+    // Phase 116.3: 1-second delta snapshots for cross-exchange consensus
+    let mut last_consensus_ts = Utc::now();
+    let mut bn_delta_1s: f64 = 0.0;
+    let mut by_delta_1s: f64 = 0.0;
+    let mut cb_delta_1s: f64 = 0.0;
+    let mut prev_bn_delta: f64 = 0.0;
+    let mut prev_by_delta: f64 = 0.0;
+    let mut prev_cb_delta: f64 = 0.0;
     
     // Math & Flush Loop: Every 10ms
     loop {
@@ -642,21 +672,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_baseline_update_ts = now;
             }
             
-            // Phase 116A: 1-second DID Absorption Check
+            // Phase 116.1: 100ms DID Absorption Check (upgraded from 1s)
             let now_abs = Utc::now();
-            if (now_abs - last_abs_check_ts).num_milliseconds() >= 1000 {
+            if (now_abs - last_abs_check_ts).num_milliseconds() >= 100 {
                 let current_raw_delta = s.binance_delta + s.bybit_delta + s.coinbase_delta;
                 let current_raw_vol = s.binance_vol + s.bybit_vol + s.coinbase_vol;
                 
-                let delta_1s = (current_raw_delta - abs_last_global_delta).abs();
-                let vol_1s = current_raw_vol - abs_last_global_vol;
+                let delta_100ms = (current_raw_delta - abs_last_global_delta).abs();
+                let vol_100ms = current_raw_vol - abs_last_global_vol;
                 
-                let did_1s = if vol_1s > 0.0 { delta_1s / vol_1s } else { 1.0 };
+                let did_100ms = if vol_100ms > 0.0 { delta_100ms / vol_100ms } else { 1.0 };
                 
-                // Absorption: DID < 0.002 at intensity > 2.5 BTC/sec (150k ticks/min equivalent)
-                if did_1s < 0.002 && vol_1s > 2.5 {
+                // Absorption: DID < 0.002 at intensity > 0.25 BTC/100ms (= 2.5 BTC/sec)
+                if did_100ms < 0.002 && vol_100ms > 0.25 {
                     let current_price = s.binance_price;
-                    // Check if within 0.5% of anchor price (same level)
                     if absorption_anchor_price > 0.0
                        && ((current_price - absorption_anchor_price).abs() / absorption_anchor_price) < 0.005 {
                         absorption_streak += 1;
@@ -669,11 +698,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     absorption_anchor_price = 0.0;
                 }
                 
-                // Update snapshots for next 1-second window
                 abs_last_global_delta = current_raw_delta;
                 abs_last_global_vol = current_raw_vol;
                 last_abs_check_ts = now_abs;
             }
+            
+            // Phase 116.1: Hawkes EWMA Intensity Tracker (every 10ms)
+            let current_total_vol = s.binance_vol + s.bybit_vol + s.coinbase_vol;
+            let vol_tick = (current_total_vol - last_hawkes_vol).max(0.0);
+            last_hawkes_vol = current_total_vol;
+            
+            hawkes_prev_intensity = hawkes_intensity;
+            // Exponential decay + jump excitation from volume arrival
+            hawkes_intensity = hawkes_intensity * (1.0 - hawkes_decay) + hawkes_alpha * vol_tick;
+            
+            // Push to rolling buffer for percentile calculation (60s = 6000 samples at 10ms)
+            hawkes_buffer.push_back(hawkes_intensity);
+            if hawkes_buffer.len() > 6000 { hawkes_buffer.pop_front(); }
+            
+            // Calculate percentile rank
+            let mut hawkes_pctl: f64 = 0.5;
+            if hawkes_buffer.len() > 100 {
+                let count_below = hawkes_buffer.iter().filter(|&&x| x < hawkes_intensity).count();
+                hawkes_pctl = count_below as f64 / hawkes_buffer.len() as f64;
+            }
+            
+            // Derivative: rate of change per second (intensity units/sec)
+            let hawkes_deriv = (hawkes_intensity - hawkes_prev_intensity) / 0.01; // 10ms = 0.01s
+            
+            // Phase 116.3: Track 1-second delta diffs per exchange for consensus
+            let now_consensus = Utc::now();
+            if (now_consensus - last_consensus_ts).num_milliseconds() >= 1000 {
+                bn_delta_1s = s.binance_delta - prev_bn_delta;
+                by_delta_1s = s.bybit_delta - prev_by_delta;
+                cb_delta_1s = s.coinbase_delta - prev_cb_delta;
+                prev_bn_delta = s.binance_delta;
+                prev_by_delta = s.bybit_delta;
+                prev_cb_delta = s.coinbase_delta;
+                last_consensus_ts = now_consensus;
+            }
+            
+            // Phase 116.2: Integrated Depth-Weighted OFI
+            let depth_weights: [f64; 5] = [1.0, 0.8, 0.6, 0.4, 0.2];
+            let compute_ofi = |bids: &[f64; 10], asks: &[f64; 10]| -> f64 {
+                let mut wb = 0.0;
+                let mut wa = 0.0;
+                for i in 0..5 {
+                    wb += depth_weights[i] * bids[i*2+1];
+                    wa += depth_weights[i] * asks[i*2+1];
+                }
+                let total = wb + wa;
+                if total > 0.0 { (wb - wa) / total } else { 0.0 }
+            };
+            let int_ofi = s.binance_weight * compute_ofi(&s.binance_bids, &s.binance_asks)
+                        + s.bybit_weight * compute_ofi(&s.bybit_bids, &s.bybit_asks)
+                        + s.coinbase_weight * compute_ofi(&s.coinbase_bids, &s.coinbase_asks);
             
             // Phase 102: EWMV Step for Dynamic Global Unity Deviation
             let current_global_delta = s.binance_delta + s.bybit_delta + s.coinbase_delta;
@@ -761,8 +840,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (*ptr).dynamic_tau_upper.store(tau_upper.to_bits(), std::sync::atomic::Ordering::Release);
                 (*ptr).dynamic_tau_lower.store(tau_lower.to_bits(), std::sync::atomic::Ordering::Release);
                 
-                // Phase 116A: Write absorption streak to SHM
+                // Phase 116A/116.1: Write absorption streak
                 (*ptr).absorption_streak.store(absorption_streak as u64, std::sync::atomic::Ordering::Release);
+                
+                // Phase 116.1: Write Hawkes metrics
+                (*ptr).hawkes_intensity.store(hawkes_intensity.to_bits(), std::sync::atomic::Ordering::Release);
+                (*ptr).hawkes_percentile.store(hawkes_pctl.to_bits(), std::sync::atomic::Ordering::Release);
+                (*ptr).hawkes_derivative.store(hawkes_deriv.to_bits(), std::sync::atomic::Ordering::Release);
+                
+                // Phase 116.2: Write Integrated OFI
+                (*ptr).integrated_ofi.store(int_ofi.to_bits(), std::sync::atomic::Ordering::Release);
+                
+                // Phase 116.3: Write heartbeat
+                (*ptr).heartbeat_ts.store(Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64, std::sync::atomic::Ordering::Release);
+                
+                // Phase 116.3: Evaluate Execution Triggers
+                let ack = (*ptr).exec_signal_ack.load(std::sync::atomic::Ordering::Acquire);
+                let pending = (*ptr).exec_signal_type.load(std::sync::atomic::Ordering::Acquire);
+                let now_signal = Utc::now();
+                let cooldown_ok = (now_signal - last_exec_signal_ts).num_milliseconds() >= exec_cooldown_ms;
+                let can_signal = cooldown_ok && (pending == 0 || ack != 0);
+                
+                if can_signal {
+                    // BREAKOUT trigger: Hawkes P95+ AND accelerating AND OFI aligned
+                    let breakout_long = hawkes_pctl > 0.95 && hawkes_deriv > 0.0 && int_ofi > 0.15 && absorption_streak == 0;
+                    let breakout_short = hawkes_pctl > 0.95 && hawkes_deriv > 0.0 && int_ofi < -0.15 && absorption_streak == 0;
+                    
+                    // REVERSAL trigger: Sustained absorption + Hawkes decelerating + cross-exchange consensus
+                    let all_long = bn_delta_1s > 0.0 && by_delta_1s > 0.0 && cb_delta_1s > 0.0;
+                    let all_short = bn_delta_1s < 0.0 && by_delta_1s < 0.0 && cb_delta_1s < 0.0;
+                    let reversal_long = absorption_streak >= 30 && hawkes_deriv < 0.0 && all_long;
+                    let reversal_short = absorption_streak >= 30 && hawkes_deriv < 0.0 && all_short;
+                    
+                    if breakout_long || breakout_short {
+                        let dir: u64 = if breakout_long { 1 } else { 2 };
+                        let conf = hawkes_pctl.min(1.0);
+                        (*ptr).exec_signal_type.store(1, std::sync::atomic::Ordering::Release); // BREAKOUT
+                        (*ptr).exec_signal_dir.store(dir, std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_confidence.store(conf.to_bits(), std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_ts.store(now_signal.timestamp_nanos_opt().unwrap_or(0) as u64, std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_ack.store(0, std::sync::atomic::Ordering::Release);
+                        last_exec_signal_ts = now_signal;
+                        let dir_str = if breakout_long { "LONG" } else { "SHORT" };
+                        println!("  [🎯] EXECUTE_NOW: BREAKOUT {} (Hawkes P{:.0}%, OFI={:.3}, conf={:.2})", dir_str, hawkes_pctl*100.0, int_ofi, conf);
+                    } else if reversal_long || reversal_short {
+                        let dir: u64 = if reversal_long { 1 } else { 2 };
+                        let conf = (absorption_streak as f64 / 100.0).min(1.0); // More absorption = higher confidence
+                        (*ptr).exec_signal_type.store(2, std::sync::atomic::Ordering::Release); // REVERSAL
+                        (*ptr).exec_signal_dir.store(dir, std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_confidence.store(conf.to_bits(), std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_ts.store(now_signal.timestamp_nanos_opt().unwrap_or(0) as u64, std::sync::atomic::Ordering::Release);
+                        (*ptr).exec_signal_ack.store(0, std::sync::atomic::Ordering::Release);
+                        last_exec_signal_ts = now_signal;
+                        let dir_str = if reversal_long { "LONG" } else { "SHORT" };
+                        println!("  [🎯] EXECUTE_NOW: REVERSAL {} (Absorption {}x100ms, dλ/dt={:.2}, conf={:.2})", dir_str, absorption_streak, hawkes_deriv, conf);
+                    }
+                }
             }
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;

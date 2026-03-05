@@ -36,6 +36,14 @@ class MarketState(ctypes.Structure):
         ("coinbase_weight", ctypes.c_double),
         ("bybit_weight", ctypes.c_double),
         
+        # Phase 116.2: Depth Snapshots (5 levels × [price, qty])
+        ("binance_bids", ctypes.c_double * 10),
+        ("binance_asks", ctypes.c_double * 10),
+        ("bybit_bids", ctypes.c_double * 10),
+        ("bybit_asks", ctypes.c_double * 10),
+        ("coinbase_bids", ctypes.c_double * 10),
+        ("coinbase_asks", ctypes.c_double * 10),
+        
         # Phase 84/85: Tick-Level Stochastic Baselines & Entropy
         ("lambda_mu", ctypes.c_uint64),
         ("lambda_sigma", ctypes.c_uint64),
@@ -49,7 +57,23 @@ class MarketState(ctypes.Structure):
         ("dynamic_tau_lower", ctypes.c_uint64),
         
         # Phase 116A: Time-at-Support Absorption Streak
-        ("absorption_streak", ctypes.c_uint64)
+        ("absorption_streak", ctypes.c_uint64),
+        
+        # Phase 116.1: Hawkes Intensity Metrics
+        ("hawkes_intensity", ctypes.c_uint64),    # f64 bits
+        ("hawkes_percentile", ctypes.c_uint64),   # f64 bits (0.0-1.0)
+        ("hawkes_derivative", ctypes.c_uint64),   # f64 bits
+        
+        # Phase 116.2: Integrated Depth-Weighted OFI
+        ("integrated_ofi", ctypes.c_uint64),      # f64 bits
+        
+        # Phase 116.3: Execution Signal
+        ("exec_signal_type", ctypes.c_uint64),    # 0=NONE, 1=BREAKOUT, 2=REVERSAL
+        ("exec_signal_dir", ctypes.c_uint64),     # 0=NONE, 1=LONG, 2=SHORT
+        ("exec_signal_confidence", ctypes.c_uint64), # f64 bits
+        ("exec_signal_ts", ctypes.c_uint64),      # Timestamp in ns
+        ("exec_signal_ack", ctypes.c_uint64),     # Python sets to 1 to acknowledge
+        ("heartbeat_ts", ctypes.c_uint64),        # Rust heartbeat
     ]
 
 class SHMReader:

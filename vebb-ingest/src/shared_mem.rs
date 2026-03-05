@@ -36,6 +36,14 @@ pub struct MarketCoreState {
     pub binance_weight: f64,
     pub coinbase_weight: f64,
     pub bybit_weight: f64,
+    
+    // Phase 116.2: Depth Snapshots (5 levels × [price, qty])
+    pub binance_bids: [f64; 10],
+    pub binance_asks: [f64; 10],
+    pub bybit_bids: [f64; 10],
+    pub bybit_asks: [f64; 10],
+    pub coinbase_bids: [f64; 10],
+    pub coinbase_asks: [f64; 10],
 }
 
 #[repr(C)]
@@ -55,8 +63,24 @@ pub struct MarketState {
     pub dynamic_tau_upper: std::sync::atomic::AtomicU64,
     pub dynamic_tau_lower: std::sync::atomic::AtomicU64,
     
-    // Phase 116A: Time-at-Support Absorption Streak (consecutive 1-second windows of DID < 0.002 at high intensity)
+    // Phase 116A: Time-at-Support Absorption Streak (consecutive 100ms windows of DID < 0.002)
     pub absorption_streak: std::sync::atomic::AtomicU64,
+    
+    // Phase 116.1: Hawkes Intensity Metrics
+    pub hawkes_intensity: std::sync::atomic::AtomicU64,    // Current λ(t) in f64 bits
+    pub hawkes_percentile: std::sync::atomic::AtomicU64,   // Rolling percentile rank (0.0-1.0)
+    pub hawkes_derivative: std::sync::atomic::AtomicU64,   // dλ/dt in f64 bits
+    
+    // Phase 116.2: Integrated Depth-Weighted OFI
+    pub integrated_ofi: std::sync::atomic::AtomicU64,      // Cross-exchange depth-weighted OFI
+    
+    // Phase 116.3: Real-Time Execution Signal
+    pub exec_signal_type: std::sync::atomic::AtomicU64,    // 0=NONE, 1=BREAKOUT, 2=REVERSAL
+    pub exec_signal_dir: std::sync::atomic::AtomicU64,     // 0=NONE, 1=LONG, 2=SHORT
+    pub exec_signal_confidence: std::sync::atomic::AtomicU64, // f64 bits (0.0-1.0)
+    pub exec_signal_ts: std::sync::atomic::AtomicU64,      // Timestamp in ns
+    pub exec_signal_ack: std::sync::atomic::AtomicU64,     // Python sets to 1 to acknowledge
+    pub heartbeat_ts: std::sync::atomic::AtomicU64,        // Rust writes every 10ms
 }
 
 // Phase 81: Zero-Latency Event Bridge
@@ -203,6 +227,12 @@ impl Default for MarketCoreState {
             binance_weight: 0.5,
             coinbase_weight: 0.3,
             bybit_weight: 0.2,
+            binance_bids: [0.0; 10],
+            binance_asks: [0.0; 10],
+            bybit_bids: [0.0; 10],
+            bybit_asks: [0.0; 10],
+            coinbase_bids: [0.0; 10],
+            coinbase_asks: [0.0; 10],
         }
     }
 }
@@ -218,6 +248,16 @@ impl Default for MarketState {
             dynamic_tau_upper: std::sync::atomic::AtomicU64::new(0),
             dynamic_tau_lower: std::sync::atomic::AtomicU64::new(0),
             absorption_streak: std::sync::atomic::AtomicU64::new(0),
+            hawkes_intensity: std::sync::atomic::AtomicU64::new(0),
+            hawkes_percentile: std::sync::atomic::AtomicU64::new(0),
+            hawkes_derivative: std::sync::atomic::AtomicU64::new(0),
+            integrated_ofi: std::sync::atomic::AtomicU64::new(0),
+            exec_signal_type: std::sync::atomic::AtomicU64::new(0),
+            exec_signal_dir: std::sync::atomic::AtomicU64::new(0),
+            exec_signal_confidence: std::sync::atomic::AtomicU64::new(0),
+            exec_signal_ts: std::sync::atomic::AtomicU64::new(0),
+            exec_signal_ack: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_ts: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

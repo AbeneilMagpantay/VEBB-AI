@@ -681,6 +681,14 @@ class TradingBot:
             'anchor_price': 0.0,   # Price where absorption started
             'price_tolerance': 0.005  # 0.5% band for "same level"
         }
+        
+        # Phase 116.3: Real-Time Probe Position State
+        self._has_realtime_probe = False    # True if a Rust-triggered probe is active
+        self._probe_direction = None        # 'LONG' or 'SHORT'
+        self._probe_entry_price = 0.0       # Probe entry price
+        self._probe_signal_type = None      # 'BREAKOUT' or 'REVERSAL'
+        self._last_abs_streak_log = 0       # Throttle absorption logging
+        self._last_heartbeat_warn = 0       # Throttle heartbeat warnings
     
     async def _preload_candles(self):
         """Fetch recent historical candles via REST API to avoid warmup delay."""
@@ -932,6 +940,9 @@ class TradingBot:
                     # Phase 83: Periodic Stochastic Recalibration
                     if state.sequence_id % 1000 == 0: # Every ~1000 SHM events (~10s-30s depending on vol)
                         self._update_stochastic_controls()
+                    
+                    # Phase 116.3: Real-Time Execution Signal Handler
+                    await self._check_realtime_execution_signal(state)
 
                 await asyncio.sleep(0.0001) # 100 microsecond sleep
             except Exception as e:
@@ -1640,6 +1651,12 @@ class TradingBot:
         """Called when a candle closes - main decision point."""
         ts = candle["ts"]
         close = candle["close"]
+        
+        # Phase 116.4: Candle-Close Probe Reconciliation
+        if self._has_realtime_probe:
+            await self._reconcile_probe(candle)
+            # Don't return — allow normal candle processing to continue for logging
+        
         
         # Phase 78c Unity: Global Synthetic Candle Calculation
         state = self.shm_reader.read()
@@ -2896,6 +2913,189 @@ class TradingBot:
         except Exception as e:
             self.logger.error(f"Macro consensus check failed: {e}")
             return (True, "UNKNOWN") # Fallback to 15m autonomy
+    
+    def _decode_f64(self, raw_u64: int) -> float:
+        """Decode a u64 (AtomicU64) SHM field back to f64."""
+        import struct
+        return struct.unpack('d', struct.pack('Q', raw_u64))[0]
+    
+    async def _check_realtime_execution_signal(self, state):
+        """Phase 116.3: Poll SHM for Rust-generated EXECUTE_NOW signals."""
+        import time as _time
+        import ctypes
+        
+        try:
+            # Heartbeat Watchdog: Detect Rust crash
+            if hasattr(state, 'heartbeat_ts') and state.heartbeat_ts > 0:
+                age_ns = _time.time_ns() - state.heartbeat_ts
+                if age_ns > 500_000_000:  # 500ms stale
+                    now_t = _time.time()
+                    if now_t - self._last_heartbeat_warn > 10:  # Warn every 10s max
+                        print(f"  [{self.timeframe} ⚠️] SHM heartbeat stale ({age_ns/1e6:.0f}ms) — Rust may have crashed")
+                        self._last_heartbeat_warn = now_t
+                    return
+            
+            # Check for pending execution signal
+            if not hasattr(state, 'exec_signal_type'):
+                return
+            
+            sig_type = state.exec_signal_type
+            sig_ack = state.exec_signal_ack
+            
+            # No signal or already acknowledged
+            if sig_type == 0 or sig_ack != 0:
+                return
+            
+            # Already have a position (probe or standard)
+            if self.position_manager.position is not None:
+                # Acknowledge to prevent Rust from blocking
+                try:
+                    shm = self.shm_reader._shm
+                    if shm:
+                        ms = MarketState.from_buffer(shm.buf)
+                        ms.exec_signal_ack = 1
+                except:
+                    pass
+                return
+            
+            # Decode signal
+            sig_dir = state.exec_signal_dir  # 1=LONG, 2=SHORT
+            sig_conf = self._decode_f64(state.exec_signal_confidence)
+            sig_type_name = "BREAKOUT" if sig_type == 1 else "REVERSAL"
+            direction = "LONG" if sig_dir == 1 else "SHORT"
+            
+            # Log the signal
+            int_ofi = self._decode_f64(state.integrated_ofi) if hasattr(state, 'integrated_ofi') else 0.0
+            hawkes_p = self._decode_f64(state.hawkes_percentile) if hasattr(state, 'hawkes_percentile') else 0.0
+            print(f"\n  [{self.timeframe} 🎯] EXECUTE_NOW: {sig_type_name} {direction}")
+            print(f"      Confidence={sig_conf:.2f} | Hawkes P{hawkes_p*100:.0f}% | IntOFI={int_ofi:.3f}")
+            
+            # Phase 116.3: Execute Probe Position (33% of standard size)
+            price = state.binance_price
+            if price <= 0:
+                return
+            
+            full_qty = self.position_manager.get_max_position_size(price)
+            # Dynamic probe size: scale with confidence (33%-75%)
+            probe_pct = 0.33 + (sig_conf * 0.42)  # At conf=1.0 → 75%, at conf=0.0 → 33%
+            probe_qty = max(self.position_manager._min_qty, round(full_qty * probe_pct, 6))
+            
+            if probe_qty == 0:
+                return
+            
+            # Get live price for execution
+            live_price = await self.exchange.get_current_price()
+            if live_price == 0.0:
+                live_price = price
+            
+            order_side = OrderSide.BUY if direction == "LONG" else OrderSide.SELL
+            side = Side.LONG if direction == "LONG" else Side.SHORT
+            
+            print(f"  📈 PROBE {direction}: {probe_qty:.6f} @ ${live_price:,.2f} ({probe_pct*100:.0f}% of full size)")
+            
+            result = await self.exchange.place_market_order(order_side, probe_qty, estimated_price=live_price)
+            
+            if result.success:
+                self.position_manager.open_position(side, probe_qty, result.price)
+                self._has_realtime_probe = True
+                self._probe_direction = direction
+                self._probe_entry_price = result.price
+                self._probe_signal_type = sig_type_name
+                self.entry_time = datetime.now()
+                self.entry_delta = getattr(self.footprint.current, 'cumulative_delta', 0.0) if self.footprint.current else 0.0
+                
+                # Set entry type for dynamic TP/SL
+                self._p116a_override_active = True
+                
+                # Calculate and set exchange-level stop-loss for safety
+                sl_pct = 0.005  # 0.5% tight stop for probes
+                if direction == "LONG":
+                    sl_price = result.price * (1 - sl_pct)
+                else:
+                    sl_price = result.price * (1 + sl_pct)
+                
+                print(f"  ✅ PROBE filled @ ${result.price:,.2f} | Exchange SL @ ${sl_price:,.2f}")
+                self.logger.info(f"P116.3 PROBE {sig_type_name} {direction}: qty={probe_qty:.6f} price=${result.price:,.2f} conf={sig_conf:.2f} SL=${sl_price:,.2f}")
+            else:
+                print(f"  ❌ PROBE failed: {result.message}")
+            
+            # Acknowledge signal regardless of execution result
+            try:
+                shm = self.shm_reader._shm
+                if shm:
+                    ms = MarketState.from_buffer(shm.buf)
+                    ms.exec_signal_ack = 1
+            except:
+                pass
+        except Exception as e:
+            print(f"  [P116.3] Signal handler error: {e}")
+    
+    async def _reconcile_probe(self, candle: dict):
+        """Phase 116.4: Candle-close reconciliation of probe positions."""
+        if not self._has_realtime_probe:
+            return
+        
+        close = candle["close"]
+        profit_pct = self.position_manager.get_profit_pct(close)
+        
+        print(f"\n  [{self.timeframe} 🔄] PROBE RECONCILIATION:")
+        print(f"      Type={self._probe_signal_type} | Dir={self._probe_direction} | Entry=${self._probe_entry_price:,.2f}")
+        print(f"      Close=${close:,.2f} | PnL={profit_pct*100:+.2f}%")
+        
+        # Check if the 15m candle confirms the probe direction
+        state = self.shm_reader.read()
+        candle_delta = 0.0
+        if state and self.is_shm_init:
+            candle_delta = state.global_raw_delta - self.global_delta_start
+        else:
+            candle_delta = getattr(self.footprint.current, 'cumulative_delta', 0.0) if self.footprint.current else 0.0
+        
+        # Validation criteria: candle delta confirms probe direction
+        confirmed = False
+        if self._probe_direction == "LONG" and candle_delta > 0:
+            confirmed = True
+        elif self._probe_direction == "SHORT" and candle_delta < 0:
+            confirmed = True
+        
+        # Also check profit — if already profitable, keep it
+        if profit_pct > 0.002:  # > 0.2% profit = it's working
+            confirmed = True
+        
+        # Also invalidate if deeply negative
+        if profit_pct < -0.003:  # > 0.3% loss = probe was wrong
+            confirmed = False
+        
+        if confirmed:
+            # VALIDATE: Probe confirmed by 15m candle → keep position, mark as standard
+            print(f"  ✅ PROBE VALIDATED: 15m candle confirms {self._probe_direction} (delta={candle_delta:+.1f})")
+            self.logger.info(f"P116.4 PROBE VALIDATED: {self._probe_signal_type} {self._probe_direction} confirmed at 15m close")
+            # Convert probe to standard position (keep it, remove probe flag)
+            self._has_realtime_probe = False
+            self._probe_direction = None
+            self._probe_signal_type = None
+        else:
+            # INVALIDATE: Probe rejected → close position
+            print(f"  ❌ PROBE INVALIDATED: 15m candle rejects {self._probe_direction} (delta={candle_delta:+.1f})")
+            self.logger.info(f"P116.4 PROBE INVALIDATED: {self._probe_signal_type} {self._probe_direction} closed at 15m")
+            
+            live_price = await self.exchange.get_current_price()
+            if live_price == 0.0:
+                live_price = close
+            
+            # Close the probe position
+            pos = self.position_manager.position
+            if pos:
+                close_side = OrderSide.SELL if pos.side == Side.LONG else OrderSide.BUY
+                result = await self.exchange.place_market_order(close_side, pos.quantity, estimated_price=live_price)
+                if result.success:
+                    self.position_manager.close_position(result.price)
+                    print(f"  ✅ Probe closed @ ${result.price:,.2f} | PnL={profit_pct*100:+.2f}%")
+                else:
+                    print(f"  ❌ Probe close failed: {result.message}")
+            
+            self._has_realtime_probe = False
+            self._probe_direction = None
+            self._probe_signal_type = None
     
     async def _execute_signal(self, signal, price: float):
         """Execute a trade signal."""
