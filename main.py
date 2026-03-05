@@ -2970,6 +2970,15 @@ class TradingBot:
             print(f"\n  [{self.timeframe} 🎯] EXECUTE_NOW: {sig_type_name} {direction}")
             print(f"      Confidence={sig_conf:.2f} | Hawkes P{hawkes_p*100:.0f}% | IntOFI={int_ofi:.3f}")
             
+            # Acknowledge signal IMMEDIATELY to prevent spam on errors
+            try:
+                shm_w = self.shm_reader._shm
+                if shm_w:
+                    ms_w = MarketState.from_buffer(shm_w.buf)
+                    ms_w.exec_signal_ack = 1
+            except:
+                pass
+            
             # Phase 116.3: Execute Probe Position (33% of standard size)
             price = state.binance_price
             if price <= 0:
@@ -2978,7 +2987,8 @@ class TradingBot:
             full_qty = self.position_manager.get_max_position_size(price)
             # Dynamic probe size: scale with confidence (33%-75%)
             probe_pct = 0.33 + (sig_conf * 0.42)  # At conf=1.0 → 75%, at conf=0.0 → 33%
-            probe_qty = max(self.position_manager._min_qty, round(full_qty * probe_pct, 6))
+            MIN_ORDER_QTY = 0.001  # Binance BTCUSDT minimum
+            probe_qty = max(MIN_ORDER_QTY, round(full_qty * probe_pct, 6))
             
             if probe_qty == 0:
                 return
@@ -3018,15 +3028,6 @@ class TradingBot:
                 self.logger.info(f"P116.3 PROBE {sig_type_name} {direction}: qty={probe_qty:.6f} price=${result.price:,.2f} conf={sig_conf:.2f} SL=${sl_price:,.2f}")
             else:
                 print(f"  ❌ PROBE failed: {result.message}")
-            
-            # Acknowledge signal regardless of execution result
-            try:
-                shm = self.shm_reader._shm
-                if shm:
-                    ms = MarketState.from_buffer(shm.buf)
-                    ms.exec_signal_ack = 1
-            except:
-                pass
         except Exception as e:
             print(f"  [P116.3] Signal handler error: {e}")
     
