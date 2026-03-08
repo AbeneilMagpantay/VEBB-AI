@@ -689,7 +689,7 @@ class TradingBot:
         self._probe_signal_type = None      # 'BREAKOUT' or 'REVERSAL'
         self._last_abs_streak_log = 0       # Throttle absorption logging
         self._last_heartbeat_warn = 0       # Throttle heartbeat warnings
-        self._shm_signal_flushed = False     # Phase 116.5: Flush stale SHM signals on first poll
+        self._signal_suppress_until = datetime.now().timestamp() + 60  # Phase 116.5: Suppress all signals for 60s after startup
     
     async def _preload_candles(self):
         """Fetch recent historical candles via REST API to avoid warmup delay."""
@@ -2947,11 +2947,11 @@ class TradingBot:
             if sig_type == 0 or sig_ack != 0:
                 return
             
-            # Phase 116.5: Flush stale signals from previous Rust process
-            # SHM persists across restarts — old signals survive in memory
-            if not self._shm_signal_flushed:
-                self._shm_signal_flushed = True
-                print(f"  [{self.timeframe}] Flushing stale SHM signal (type={sig_type}) from previous run")
+            # Phase 116.5: Suppress ALL signals for 60s after Python startup
+            # Covers: stale SHM, duplicate Rust processes, CUSUM cold-start
+            import time as _time
+            if _time.time() < self._signal_suppress_until:
+                # Acknowledge to prevent Rust from blocking, but don't execute
                 try:
                     shm_w = self.shm_reader._shm
                     if shm_w:
