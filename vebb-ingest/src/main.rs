@@ -549,10 +549,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut hawkes_warmup_ticks: u64 = 0;
     let hawkes_warmup_min: u64 = 7000; // 70s: 60s fast warmup + 10s stabilization on slow EWMA
     
-    // Phase 116.5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
-    let mut cusum_score: f64 = 0.0;
-    let mut intensity_mean: f64 = 0.0;  // EWMA of hawkes_intensity (for CUSUM baseline)
-    let mut intensity_var: f64 = 0.0;   // EWMA of intensity variance (for CUSUM threshold)
+    // Phase 116.6: Branching Ratio Regime Detection (Hardiman-Bouchaud 2014, Filimonov & Sornette 2012)
+    // Monitors market reflexivity (n*) instead of raw intensity — immune to normal clustering
+    let n_critical: f64 = 0.95;       // Market criticality threshold (Filimonov & Sornette)
+    let cusum_k: f64 = (target_branching + n_critical) / 2.0;  // Derived drift = midpoint = 0.875
+    let persistence_ticks: f64 = 10.0; // n* must persistently exceed midpoint for this many ticks
+    let cusum_h: f64 = persistence_ticks * (n_critical - cusum_k); // Derived decision boundary
+    let mut raw_vol_mean: f64 = 0.0;  // EWMA of raw volume (for n* estimation)
+    let mut raw_vol_var: f64 = 0.0;   // EWMA of raw volume variance
+    let mut n_star_estimate: f64 = 0.0; // Current estimated branching ratio
+    let mut cusum_n_score: f64 = 0.0; // CUSUM accumulator on branching ratio
     
     // Phase 116.5: Execution signal cooldown — 6.5s (t_95 relaxation time)
     let mut last_exec_signal_ts = Utc::now();
@@ -747,8 +753,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             // Reset CUSUM exactly when warmup ends to flush accumulated garbage
             if hawkes_warmup_ticks == hawkes_warmup_min {
-                cusum_score = 0.0;
-                println!("  [⚡] Hawkes warmup complete. vol_mean={:.6}, α={:.4}, int_mean={:.6}, int_σ={:.6}", vol_mean, hawkes_alpha, intensity_mean, intensity_var.sqrt());
+                cusum_n_score = 0.0;
+                println!("  [⚡] Hawkes warmup complete. vol_mean={:.6}, α={:.4}, n*={:.4}, cusum_k={:.4}, cusum_h={:.4}", vol_mean, hawkes_alpha, n_star_estimate, cusum_k, cusum_h);
             }
             hawkes_warmup_ticks += 1;
             
@@ -760,26 +766,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hawkes_prev_intensity = hawkes_intensity;
             hawkes_intensity = hawkes_intensity * (1.0 - hawkes_decay) + hawkes_alpha * bounded_vol;
             
-            // Step 5: Track intensity's OWN baseline (same tiered decay as volume)
-            // CUSUM must compare intensity against its own mean, NOT vol_mean
-            intensity_mean = intensity_mean * (1.0 - active_decay) + hawkes_intensity * active_decay;
-            let int_diff = hawkes_intensity - intensity_mean;
-            intensity_var = intensity_var * (1.0 - active_decay) + (int_diff * int_diff) * active_decay;
+            // Phase 116.6: Branching Ratio Estimation (Hardiman-Bouchaud 2014)
+            // n* ≈ 1 - sqrt(μ/σ²) — captures market reflexivity, immune to normal clustering
+            // Uses RAW volume (not log-transformed) to preserve the mean/variance ratio
+            raw_vol_mean = raw_vol_mean * (1.0 - active_decay) + raw_vol_tick * active_decay;
+            let raw_diff = raw_vol_tick - raw_vol_mean;
+            raw_vol_var = raw_vol_var * (1.0 - active_decay) + (raw_diff * raw_diff) * active_decay;
             
-            // Step 6: O(1) CUSUM anomaly detection
-            // Drift = allowable noise floor (0.5× intensity mean)
-            let cusum_drift = 0.5 * intensity_mean;
-            cusum_score = f64::max(0.0, cusum_score + hawkes_intensity - intensity_mean - cusum_drift);
+            if raw_vol_var > 1e-12 {
+                let ratio = (raw_vol_mean / raw_vol_var).max(0.0).min(1.0);
+                n_star_estimate = 1.0 - ratio.sqrt();
+            } else {
+                n_star_estimate = 0.0;
+            }
             
-            // Step 7: Threshold from intensity volatility (5σ for self-exciting processes)
-            // Hawkes intensity naturally triples during clustered trades — 3σ is too sensitive
-            let cusum_threshold = 5.0 * f64::max(intensity_var.sqrt(), 1e-9);
-            let breakout_detected = cusum_score > cusum_threshold;
+            // CUSUM on branching ratio: accumulates when n* persistently exceeds midpoint
+            cusum_n_score = f64::max(0.0, cusum_n_score + n_star_estimate - cusum_k);
+            let breakout_detected = cusum_n_score > cusum_h;
             
-            // Reset CUSUM on trigger to prevent re-firing (save peak for confidence)
-            let cusum_peak = cusum_score; // Capture before reset
+            // Save peak and reset on detection
+            let cusum_peak = cusum_n_score;
             if breakout_detected {
-                cusum_score = 0.0;
+                cusum_n_score = 0.0;
             }
             
             // Derivative: rate of change per second (intensity units/sec)
@@ -902,9 +910,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Phase 116A/116.1: Write absorption streak
                 (*ptr).absorption_streak.store(absorption_streak as u64, std::sync::atomic::Ordering::Release);
                 
-                // Phase 116.5: Write Hawkes metrics + CUSUM
+                // Phase 116.6: Write Hawkes metrics + Branching Ratio
                 (*ptr).hawkes_intensity.store(hawkes_intensity.to_bits(), std::sync::atomic::Ordering::Release);
-                (*ptr).hawkes_percentile.store(cusum_score.to_bits(), std::sync::atomic::Ordering::Release); // Repurposed: now stores CUSUM score
+                (*ptr).hawkes_percentile.store(n_star_estimate.to_bits(), std::sync::atomic::Ordering::Release); // Repurposed: stores estimated n*
                 (*ptr).hawkes_derivative.store(hawkes_deriv.to_bits(), std::sync::atomic::Ordering::Release);
                 
                 // Phase 116.2: Write Integrated OFI
@@ -934,7 +942,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if breakout_long || breakout_short {
                         let dir: u64 = if breakout_long { 1 } else { 2 };
                         // Confidence = how far CUSUM exceeded threshold (capped at 1.0)
-                        let conf = if cusum_threshold > 0.0 { (cusum_peak / cusum_threshold).min(1.0) } else { 0.5 };
+                        let conf = if cusum_h > 0.0 { (cusum_peak / cusum_h).min(1.0) } else { 0.5 };
                         (*ptr).exec_signal_type.store(1, std::sync::atomic::Ordering::Release); // BREAKOUT
                         (*ptr).exec_signal_dir.store(dir, std::sync::atomic::Ordering::Release);
                         (*ptr).exec_signal_confidence.store(conf.to_bits(), std::sync::atomic::Ordering::Release);
@@ -942,7 +950,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (*ptr).exec_signal_ack.store(0, std::sync::atomic::Ordering::Release);
                         last_exec_signal_ts = now_signal;
                         let dir_str = if breakout_long { "LONG" } else { "SHORT" };
-                        println!("  [🎯] EXECUTE_NOW: BREAKOUT {} (CUSUM={:.3}/{:.3}, OFI={:.3}, α={:.4}, conf={:.2})", dir_str, cusum_score, cusum_threshold, int_ofi, hawkes_alpha, conf);
+                        println!("  [🎯] EXECUTE_NOW: BREAKOUT {} (n*={:.4}, CUSUM={:.3}/{:.3}, OFI={:.3}, conf={:.2})", dir_str, n_star_estimate, cusum_n_score, cusum_h, int_ofi, conf);
                     } else if reversal_long || reversal_short {
                         let dir: u64 = if reversal_long { 1 } else { 2 };
                         let conf = (absorption_streak as f64 / 100.0).min(1.0); // More absorption = higher confidence

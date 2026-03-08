@@ -2981,9 +2981,9 @@ class TradingBot:
             
             # Log the signal
             int_ofi = self._decode_f64(state.integrated_ofi) if hasattr(state, 'integrated_ofi') else 0.0
-            cusum = self._decode_f64(state.hawkes_percentile) if hasattr(state, 'hawkes_percentile') else 0.0  # Repurposed: now CUSUM score
+            n_star = self._decode_f64(state.hawkes_percentile) if hasattr(state, 'hawkes_percentile') else 0.0  # Phase 116.6: estimated n*
             print(f"\n  [{self.timeframe} 🎯] EXECUTE_NOW: {sig_type_name} {direction}")
-            print(f"      Confidence={sig_conf:.2f} | CUSUM={cusum:.3f} | IntOFI={int_ofi:.3f}")
+            print(f"      Confidence={sig_conf:.2f} | n*={n_star:.4f} | IntOFI={int_ofi:.3f}")
             
             # Acknowledge signal IMMEDIATELY to prevent spam on errors
             try:
