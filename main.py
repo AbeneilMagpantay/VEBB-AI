@@ -2966,9 +2966,9 @@ class TradingBot:
             
             # Log the signal
             int_ofi = self._decode_f64(state.integrated_ofi) if hasattr(state, 'integrated_ofi') else 0.0
-            hawkes_p = self._decode_f64(state.hawkes_percentile) if hasattr(state, 'hawkes_percentile') else 0.0
+            cusum = self._decode_f64(state.hawkes_percentile) if hasattr(state, 'hawkes_percentile') else 0.0  # Repurposed: now CUSUM score
             print(f"\n  [{self.timeframe} 🎯] EXECUTE_NOW: {sig_type_name} {direction}")
-            print(f"      Confidence={sig_conf:.2f} | Hawkes P{hawkes_p*100:.0f}% | IntOFI={int_ofi:.3f}")
+            print(f"      Confidence={sig_conf:.2f} | CUSUM={cusum:.3f} | IntOFI={int_ofi:.3f}")
             
             # Acknowledge signal IMMEDIATELY to prevent spam on errors
             try:

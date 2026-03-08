@@ -521,17 +521,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut absorption_streak: u32 = 0;
     let mut absorption_anchor_price: f64 = 0.0;
     
-    // Phase 116.1: Hawkes EWMA Intensity Tracker  
+    // Phase 116.5: Calibrated Hawkes EWMA Intensity Tracker
+    // Based on: El Karmi (2025) arXiv:2510.08085, Bacry et al. (2015), Da Fonseca & Zaatour (2014)
     let mut hawkes_intensity: f64 = 0.0;
     let mut hawkes_prev_intensity: f64 = 0.0;
-    let hawkes_alpha: f64 = 0.3;      // Jump excitation factor
-    let hawkes_decay: f64 = 0.05;     // Decay per 10ms tick
-    let mut hawkes_buffer: std::collections::VecDeque<f64> = std::collections::VecDeque::with_capacity(6000);
+    let hawkes_decay: f64 = 0.023;    // β_d per 10ms → 300ms half-life (empirical BTC/USDT optimum)
+    let mut hawkes_alpha: f64 = 0.0;  // Adaptive — computed from rolling moments
+    let target_branching: f64 = 0.80; // Target n* = 0.80 (subcritical, per El Karmi 2025)
     let mut last_hawkes_vol: f64 = 0.0;
     
-    // Phase 116.3: Execution signal cooldown
+    // Phase 116.5: O(1) rolling moment trackers (5-min half-life EWMA)
+    let moment_decay: f64 = 0.00002;  // ~5.77 min half-life at 10ms ticks
+    let mut vol_mean: f64 = 0.0;
+    let mut vol_var: f64 = 0.0;
+    let mut hawkes_warmup_ticks: u64 = 0;
+    let hawkes_warmup_min: u64 = 6000; // 60s minimum before firing signals
+    
+    // Phase 116.5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
+    let mut cusum_score: f64 = 0.0;
+    
+    // Phase 116.5: Execution signal cooldown — 6.5s (t_95 relaxation time)
     let mut last_exec_signal_ts = Utc::now();
-    let exec_cooldown_ms: i64 = 30000; // 30s cooldown between signals
+    let exec_cooldown_ms: i64 = 6500; // Derived from β_eff = β(1-n) = 0.464/s → t_95 ≈ 6.45s
     
     // Phase 116.3: 1-second delta snapshots for cross-exchange consensus
     let mut last_consensus_ts = Utc::now();
@@ -703,24 +714,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last_abs_check_ts = now_abs;
             }
             
-            // Phase 116.1: Hawkes EWMA Intensity Tracker (every 10ms)
+            // Phase 116.5: Calibrated Hawkes EWMA Intensity Tracker (every 10ms)
             let current_total_vol = s.binance_vol + s.bybit_vol + s.coinbase_vol;
-            let vol_tick = (current_total_vol - last_hawkes_vol).max(0.0);
+            let raw_vol_tick = (current_total_vol - last_hawkes_vol).max(0.0);
             last_hawkes_vol = current_total_vol;
             
+            // Step 1: Log-transform volume to enforce stationarity (Bacry et al. 2015)
+            // Prevents heavy-tailed crypto volumes from causing supercritical explosion
+            let bounded_vol = f64::ln(1.0 + raw_vol_tick);
+            
+            // Step 2: Update O(1) rolling moments (5-min EWMA)
+            vol_mean = vol_mean * (1.0 - moment_decay) + bounded_vol * moment_decay;
+            let vol_diff = bounded_vol - vol_mean;
+            vol_var = vol_var * (1.0 - moment_decay) + (vol_diff * vol_diff) * moment_decay;
+            hawkes_warmup_ticks += 1;
+            
+            // Step 3: Adaptive alpha — scale inversely to rolling mean volume
+            // Ensures branching ratio n* = (α × E[V]) / β stays at target 0.80
+            hawkes_alpha = (target_branching * hawkes_decay) / f64::max(vol_mean, 1e-6);
+            
+            // Step 4: Update Hawkes intensity with calibrated parameters
             hawkes_prev_intensity = hawkes_intensity;
-            // Exponential decay + jump excitation from volume arrival
-            hawkes_intensity = hawkes_intensity * (1.0 - hawkes_decay) + hawkes_alpha * vol_tick;
+            hawkes_intensity = hawkes_intensity * (1.0 - hawkes_decay) + hawkes_alpha * bounded_vol;
             
-            // Push to rolling buffer for percentile calculation (60s = 6000 samples at 10ms)
-            hawkes_buffer.push_back(hawkes_intensity);
-            if hawkes_buffer.len() > 6000 { hawkes_buffer.pop_front(); }
+            // Step 5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
+            // Drift = noise floor before CUSUM accumulates
+            let cusum_drift = 0.5 * vol_mean;
+            cusum_score = f64::max(0.0, cusum_score + hawkes_intensity - vol_mean - cusum_drift);
             
-            // Calculate percentile rank
-            let mut hawkes_pctl: f64 = 0.5;
-            if hawkes_buffer.len() > 100 {
-                let count_below = hawkes_buffer.iter().filter(|&&x| x < hawkes_intensity).count();
-                hawkes_pctl = count_below as f64 / hawkes_buffer.len() as f64;
+            // Step 6: Compute trigger threshold from rolling volatility
+            let cusum_threshold = 3.0 * f64::max(vol_var.sqrt(), 1e-9);
+            let breakout_detected = cusum_score > cusum_threshold;
+            
+            // Reset CUSUM on trigger to prevent re-firing
+            if breakout_detected {
+                cusum_score = 0.0;
             }
             
             // Derivative: rate of change per second (intensity units/sec)
@@ -843,9 +871,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Phase 116A/116.1: Write absorption streak
                 (*ptr).absorption_streak.store(absorption_streak as u64, std::sync::atomic::Ordering::Release);
                 
-                // Phase 116.1: Write Hawkes metrics
+                // Phase 116.5: Write Hawkes metrics + CUSUM
                 (*ptr).hawkes_intensity.store(hawkes_intensity.to_bits(), std::sync::atomic::Ordering::Release);
-                (*ptr).hawkes_percentile.store(hawkes_pctl.to_bits(), std::sync::atomic::Ordering::Release);
+                (*ptr).hawkes_percentile.store(cusum_score.to_bits(), std::sync::atomic::Ordering::Release); // Repurposed: now stores CUSUM score
                 (*ptr).hawkes_derivative.store(hawkes_deriv.to_bits(), std::sync::atomic::Ordering::Release);
                 
                 // Phase 116.2: Write Integrated OFI
@@ -859,12 +887,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let pending = (*ptr).exec_signal_type.load(std::sync::atomic::Ordering::Acquire);
                 let now_signal = Utc::now();
                 let cooldown_ok = (now_signal - last_exec_signal_ts).num_milliseconds() >= exec_cooldown_ms;
-                let can_signal = cooldown_ok && hawkes_buffer.len() >= 6000 && (pending == 0 || ack != 0);
+                let can_signal = cooldown_ok && hawkes_warmup_ticks >= hawkes_warmup_min && (pending == 0 || ack != 0);
                 
                 if can_signal {
-                    // BREAKOUT trigger: Hawkes P95+ AND accelerating AND OFI aligned
-                    let breakout_long = hawkes_pctl > 0.95 && hawkes_deriv > 0.0 && int_ofi > 0.15 && absorption_streak == 0;
-                    let breakout_short = hawkes_pctl > 0.95 && hawkes_deriv > 0.0 && int_ofi < -0.15 && absorption_streak == 0;
+                    // BREAKOUT trigger: CUSUM breach AND accelerating AND OFI aligned
+                    let breakout_long = breakout_detected && hawkes_deriv > 0.0 && int_ofi > 0.15 && absorption_streak == 0;
+                    let breakout_short = breakout_detected && hawkes_deriv > 0.0 && int_ofi < -0.15 && absorption_streak == 0;
                     
                     // REVERSAL trigger: Sustained absorption + Hawkes decelerating + cross-exchange consensus
                     let all_long = bn_delta_1s > 0.0 && by_delta_1s > 0.0 && cb_delta_1s > 0.0;
@@ -874,7 +902,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     
                     if breakout_long || breakout_short {
                         let dir: u64 = if breakout_long { 1 } else { 2 };
-                        let conf = hawkes_pctl.min(1.0);
+                        // Confidence = how far CUSUM exceeded threshold (capped at 1.0)
+                        let conf = if cusum_threshold > 0.0 { (cusum_score / cusum_threshold).min(1.0) } else { 0.5 };
                         (*ptr).exec_signal_type.store(1, std::sync::atomic::Ordering::Release); // BREAKOUT
                         (*ptr).exec_signal_dir.store(dir, std::sync::atomic::Ordering::Release);
                         (*ptr).exec_signal_confidence.store(conf.to_bits(), std::sync::atomic::Ordering::Release);
@@ -882,7 +911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         (*ptr).exec_signal_ack.store(0, std::sync::atomic::Ordering::Release);
                         last_exec_signal_ts = now_signal;
                         let dir_str = if breakout_long { "LONG" } else { "SHORT" };
-                        println!("  [🎯] EXECUTE_NOW: BREAKOUT {} (Hawkes P{:.0}%, OFI={:.3}, conf={:.2})", dir_str, hawkes_pctl*100.0, int_ofi, conf);
+                        println!("  [🎯] EXECUTE_NOW: BREAKOUT {} (CUSUM={:.3}/{:.3}, OFI={:.3}, α={:.4}, conf={:.2})", dir_str, cusum_score, cusum_threshold, int_ofi, hawkes_alpha, conf);
                     } else if reversal_long || reversal_short {
                         let dir: u64 = if reversal_long { 1 } else { 2 };
                         let conf = (absorption_streak as f64 / 100.0).min(1.0); // More absorption = higher confidence
