@@ -547,7 +547,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut vol_mean: f64 = 0.0;
     let mut vol_var: f64 = 0.0;
     let mut hawkes_warmup_ticks: u64 = 0;
-    let hawkes_warmup_min: u64 = 6000; // 60s minimum before firing signals
+    let hawkes_warmup_min: u64 = 7000; // 70s: 60s fast warmup + 10s stabilization on slow EWMA
     
     // Phase 116.5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
     let mut cusum_score: f64 = 0.0;
@@ -771,8 +771,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cusum_drift = 0.5 * intensity_mean;
             cusum_score = f64::max(0.0, cusum_score + hawkes_intensity - intensity_mean - cusum_drift);
             
-            // Step 7: Threshold from intensity volatility (3σ)
-            let cusum_threshold = 3.0 * f64::max(intensity_var.sqrt(), 1e-9);
+            // Step 7: Threshold from intensity volatility (5σ for self-exciting processes)
+            // Hawkes intensity naturally triples during clustered trades — 3σ is too sensitive
+            let cusum_threshold = 5.0 * f64::max(intensity_var.sqrt(), 1e-9);
             let breakout_detected = cusum_score > cusum_threshold;
             
             // Reset CUSUM on trigger to prevent re-firing (save peak for confidence)
