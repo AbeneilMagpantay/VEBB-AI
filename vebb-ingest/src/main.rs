@@ -723,10 +723,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Prevents heavy-tailed crypto volumes from causing supercritical explosion
             let bounded_vol = f64::ln(1.0 + raw_vol_tick);
             
-            // Step 2: Update O(1) rolling moments (5-min EWMA)
-            vol_mean = vol_mean * (1.0 - moment_decay) + bounded_vol * moment_decay;
+            // Step 2: Update O(1) rolling moments with TIERED decay
+            // During warmup: fast decay (0.005/tick ≈ 70ms half-life) so vol_mean converges quickly
+            // After warmup: slow decay (0.00002/tick ≈ 5.77min half-life) for statistical stability
+            let active_decay = if hawkes_warmup_ticks < hawkes_warmup_min { 0.005 } else { moment_decay };
+            vol_mean = vol_mean * (1.0 - active_decay) + bounded_vol * active_decay;
             let vol_diff = bounded_vol - vol_mean;
-            vol_var = vol_var * (1.0 - moment_decay) + (vol_diff * vol_diff) * moment_decay;
+            vol_var = vol_var * (1.0 - active_decay) + (vol_diff * vol_diff) * active_decay;
+            
+            // Reset CUSUM exactly when warmup ends to flush accumulated garbage
+            if hawkes_warmup_ticks == hawkes_warmup_min {
+                cusum_score = 0.0;
+                println!("  [⚡] Hawkes warmup complete. vol_mean={:.6}, vol_var={:.6}, α={:.6}", vol_mean, vol_var, hawkes_alpha);
+            }
             hawkes_warmup_ticks += 1;
             
             // Step 3: Adaptive alpha — scale inversely to rolling mean volume
