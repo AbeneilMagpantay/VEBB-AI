@@ -35,6 +35,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("  [System] Shared Memory established at: {}", shm_link);
+    
+    // Phase 116.5: Clear stale execution signals on startup
+    // SHM persists across restarts — old exec_signal_* fields would trigger false trades
+    unsafe {
+        let ptr = shm.as_ptr() as *mut MarketState;
+        (*ptr).exec_signal_type.store(0, std::sync::atomic::Ordering::Release);
+        (*ptr).exec_signal_dir.store(0, std::sync::atomic::Ordering::Release);
+        (*ptr).exec_signal_confidence.store(0, std::sync::atomic::Ordering::Release);
+        (*ptr).exec_signal_ts.store(0, std::sync::atomic::Ordering::Release);
+        (*ptr).exec_signal_ack.store(0, std::sync::atomic::Ordering::Release);
+    }
+    println!("  [System] Stale execution signals cleared.");
 
     // Initial state (uses the Core struct for fast internal cloning)
     let state = Arc::new(Mutex::new(MarketCoreState::default()));
