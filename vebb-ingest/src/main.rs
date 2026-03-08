@@ -551,6 +551,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Phase 116.5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
     let mut cusum_score: f64 = 0.0;
+    let mut intensity_mean: f64 = 0.0;  // EWMA of hawkes_intensity (for CUSUM baseline)
+    let mut intensity_var: f64 = 0.0;   // EWMA of intensity variance (for CUSUM threshold)
     
     // Phase 116.5: Execution signal cooldown — 6.5s (t_95 relaxation time)
     let mut last_exec_signal_ts = Utc::now();
@@ -746,7 +748,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Reset CUSUM exactly when warmup ends to flush accumulated garbage
             if hawkes_warmup_ticks == hawkes_warmup_min {
                 cusum_score = 0.0;
-                println!("  [⚡] Hawkes warmup complete. vol_mean={:.6}, vol_var={:.6}, α={:.6}", vol_mean, vol_var, hawkes_alpha);
+                println!("  [⚡] Hawkes warmup complete. vol_mean={:.6}, α={:.4}, int_mean={:.6}, int_σ={:.6}", vol_mean, hawkes_alpha, intensity_mean, intensity_var.sqrt());
             }
             hawkes_warmup_ticks += 1;
             
@@ -758,13 +760,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             hawkes_prev_intensity = hawkes_intensity;
             hawkes_intensity = hawkes_intensity * (1.0 - hawkes_decay) + hawkes_alpha * bounded_vol;
             
-            // Step 5: O(1) CUSUM anomaly detection (replaces O(N) percentile buffer)
-            // Drift = noise floor before CUSUM accumulates
-            let cusum_drift = 0.5 * vol_mean;
-            cusum_score = f64::max(0.0, cusum_score + hawkes_intensity - vol_mean - cusum_drift);
+            // Step 5: Track intensity's OWN baseline (same tiered decay as volume)
+            // CUSUM must compare intensity against its own mean, NOT vol_mean
+            intensity_mean = intensity_mean * (1.0 - active_decay) + hawkes_intensity * active_decay;
+            let int_diff = hawkes_intensity - intensity_mean;
+            intensity_var = intensity_var * (1.0 - active_decay) + (int_diff * int_diff) * active_decay;
             
-            // Step 6: Compute trigger threshold from rolling volatility
-            let cusum_threshold = 3.0 * f64::max(vol_var.sqrt(), 1e-9);
+            // Step 6: O(1) CUSUM anomaly detection
+            // Drift = allowable noise floor (0.5× intensity mean)
+            let cusum_drift = 0.5 * intensity_mean;
+            cusum_score = f64::max(0.0, cusum_score + hawkes_intensity - intensity_mean - cusum_drift);
+            
+            // Step 7: Threshold from intensity volatility (3σ)
+            let cusum_threshold = 3.0 * f64::max(intensity_var.sqrt(), 1e-9);
             let breakout_detected = cusum_score > cusum_threshold;
             
             // Reset CUSUM on trigger to prevent re-firing (save peak for confidence)
