@@ -746,7 +746,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cusum_threshold = 3.0 * f64::max(vol_var.sqrt(), 1e-9);
             let breakout_detected = cusum_score > cusum_threshold;
             
-            // Reset CUSUM on trigger to prevent re-firing
+            // Reset CUSUM on trigger to prevent re-firing (save peak for confidence)
+            let cusum_peak = cusum_score; // Capture before reset
             if breakout_detected {
                 cusum_score = 0.0;
             }
@@ -903,7 +904,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if breakout_long || breakout_short {
                         let dir: u64 = if breakout_long { 1 } else { 2 };
                         // Confidence = how far CUSUM exceeded threshold (capped at 1.0)
-                        let conf = if cusum_threshold > 0.0 { (cusum_score / cusum_threshold).min(1.0) } else { 0.5 };
+                        let conf = if cusum_threshold > 0.0 { (cusum_peak / cusum_threshold).min(1.0) } else { 0.5 };
                         (*ptr).exec_signal_type.store(1, std::sync::atomic::Ordering::Release); // BREAKOUT
                         (*ptr).exec_signal_dir.store(dir, std::sync::atomic::Ordering::Release);
                         (*ptr).exec_signal_confidence.store(conf.to_bits(), std::sync::atomic::Ordering::Release);

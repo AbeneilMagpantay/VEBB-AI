@@ -689,6 +689,7 @@ class TradingBot:
         self._probe_signal_type = None      # 'BREAKOUT' or 'REVERSAL'
         self._last_abs_streak_log = 0       # Throttle absorption logging
         self._last_heartbeat_warn = 0       # Throttle heartbeat warnings
+        self._shm_signal_flushed = False     # Phase 116.5: Flush stale SHM signals on first poll
     
     async def _preload_candles(self):
         """Fetch recent historical candles via REST API to avoid warmup delay."""
@@ -2944,6 +2945,20 @@ class TradingBot:
             
             # No signal or already acknowledged
             if sig_type == 0 or sig_ack != 0:
+                return
+            
+            # Phase 116.5: Flush stale signals from previous Rust process
+            # SHM persists across restarts — old signals survive in memory
+            if not self._shm_signal_flushed:
+                self._shm_signal_flushed = True
+                print(f"  [{self.timeframe}] Flushing stale SHM signal (type={sig_type}) from previous run")
+                try:
+                    shm_w = self.shm_reader._shm
+                    if shm_w:
+                        ms = MarketState.from_buffer(shm_w.buf)
+                        ms.exec_signal_ack = 1
+                except:
+                    pass
                 return
             
             # Already have a position (probe or standard)
